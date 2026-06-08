@@ -11,8 +11,8 @@ PixelGuard is built around an end-to-end neural watermarking pipeline (HiDDeN-st
 1. [Architecture](#architecture)
 2. [Tech stack](#tech-stack)
 3. [Repository layout](#repository-layout)
-4. [Quick start (docker-compose)](#quick-start-docker-compose)
-5. [Quick start (local dev)](#quick-start-local-dev)
+4. [Prerequisites](#prerequisites)
+5. [Quick start](#quick-start)
 6. [API overview](#api-overview)
 7. [Training the model](#training-the-model)
 8. [Deployment](#deployment)
@@ -45,9 +45,8 @@ The encoder is a fully-convolutional network: it tiles the binary tracking ID in
 |-------------|--------------------------------------------|
 | Frontend    | React 18 (CRA), react-router, react-dropzone, axios |
 | Backend     | FastAPI 0.110, Uvicorn, Motor 3.4 (async Mongo) |
-| Database    | MongoDB 7                                  |
+| Database    | MongoDB 7 (local install **or** MongoDB Atlas) |
 | ML / CV     | TensorFlow 2.15, OpenCV (headless), Kornia, scikit-image |
-| Container   | Docker + docker-compose                    |
 
 ## Repository layout
 
@@ -65,7 +64,6 @@ PixelGuard/
 │   │   ├── routes/           /encode, /decode, /tracking
 │   │   └── utils/            Image I/O, metrics, noise helpers
 │   ├── requirements.txt
-│   ├── Dockerfile
 │   └── .env.example
 │
 ├── frontend/                 React SPA
@@ -74,53 +72,82 @@ PixelGuard/
 │   │   ├── components/       Header, Footer, LoadingSpinner, Navigation
 │   │   ├── services/api.js   Axios client
 │   │   └── styles/           CSS (globals, components, variables)
-│   ├── package.json
-│   └── Dockerfile
+│   └── package.json
 │
 ├── scripts/
 │   ├── train_model.py        TensorFlow training loop
-│   ├── setup_db.py           Mongo index bootstrap
-│   └── start.sh
+│   ├── setup_db.py           MongoDB index bootstrap
+│   ├── start.sh              One-shot dev startup (macOS / Linux)
+│   └── start.ps1             One-shot dev startup (Windows PowerShell)
 │
 ├── docs/                     Architecture, API, Deployment, User guide
-├── docker-compose.yml        Mongo + backend + frontend (+ optional nginx)
-├── .env                      docker-compose env defaults
+├── .env                      Local-dev env defaults
 └── README.md
 ```
 
-## Quick start (docker-compose)
+## Prerequisites
+
+- **Python** 3.10+
+- **Node.js** 18+
+- **MongoDB** — choose one:
+  - Install **MongoDB Community Server** locally (Windows installer, `brew install mongodb-community` on macOS, or apt on Linux). It listens on `27017` by default.
+  - **OR** use **MongoDB Atlas** (free tier) — sign up at mongodb.com/cloud/atlas, create an M0 cluster, copy the SRV connection string, and put it in `backend/.env`.
+
+That's it — no Docker, no virtualization.
+
+## Quick start
+
+### Option 1: scripted (recommended)
 
 ```bash
-# 1. Bring everything up
-docker compose up --build
+# macOS / Linux
+bash scripts/start.sh
 
-# 2. Visit
-#    UI    : http://localhost:3000
-#    API   : http://localhost:8000
-#    docs  : http://localhost:8000/docs
-#    Mongo : mongodb://localhost:27017/pixelguard
+# Windows (PowerShell)
+pwsh scripts\start.ps1
 ```
 
-The first request to `/api/v1/encode` builds the (untrained) TensorFlow graphs and warm-loads weights from `./models/` if present. Without trained weights the network still runs, but you should train it before relying on the decoded IDs.
+These create the Python venv, install dependencies, ensure Mongo indexes, and launch both servers.
 
-## Quick start (local dev)
+### Option 2: manual, three terminals
+
+**Terminal 1 — MongoDB** (skip if using Atlas)
 
 ```bash
-# --- MongoDB ---
-docker run -d --name pg-mongo -p 27017:27017 mongo:7
+# macOS:   brew services start mongodb-community
+# Linux:   sudo systemctl start mongod
+# Windows: services.msc → MongoDB Server → Start  (auto-starts on install)
+```
 
-# --- Backend ---
+**Terminal 2 — Backend**
+
+```bash
 cd backend
-python -m venv .venv && source .venv/bin/activate    # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-cp .env.example .env
-uvicorn app.main:app --reload --port 8000
+python -m venv .venv
+# macOS/Linux:
+source .venv/bin/activate
+# Windows:
+.venv\Scripts\activate
 
-# --- Frontend ---
+pip install -r requirements.txt
+cp .env.example .env          # then edit MONGODB_URL if using Atlas
+
+python ../scripts/setup_db.py  # one-time: create Mongo indexes
+uvicorn app.main:app --reload --port 8000
+```
+
+**Terminal 3 — Frontend**
+
+```bash
 cd frontend
 npm install
-npm start
+npm start                      # opens http://localhost:3000
 ```
+
+Then visit:
+- UI    → http://localhost:3000
+- API   → http://localhost:8000
+- Docs  → http://localhost:8000/docs
 
 ## API overview
 
@@ -150,7 +177,11 @@ For real performance, plug COCO 2017 into `scripts/train_model.py` (see the docs
 
 ## Deployment
 
-See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for production recipes (managed MongoDB Atlas, gunicorn workers, GPU inference, TLS termination at nginx).
+For production hosting, see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) — recommended stack:
+
+- **Database** → MongoDB Atlas (managed, free tier covers a demo)
+- **Backend**  → Render / Railway / Fly.io (any Python-friendly PaaS)
+- **Frontend** → Vercel / Netlify (CRA static build)
 
 ---
 

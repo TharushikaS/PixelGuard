@@ -70,8 +70,6 @@ logs/
 *.sqlite
 build.log
 
-# Docker (keep .dockerignore tracked)
-
 # OS
 .DS_Store
 Thumbs.db

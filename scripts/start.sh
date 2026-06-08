@@ -1,63 +1,55 @@
 #!/bin/bash
-# Quick start script for PixelGuard
+# PixelGuard local startup (macOS / Linux).
+# Assumes:
+#   - MongoDB is running on $MONGODB_URL (default mongodb://localhost:27017)
+#   - Python 3.10+ and Node 18+ are on PATH
+#
+# Usage: bash scripts/start.sh
 
 set -e
 
-echo "🔒 PixelGuard - Quick Start"
-echo "=========================================="
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
 
-# Check Docker
-if ! command -v docker &> /dev/null; then
-    echo "❌ Docker is not installed"
-    exit 1
+echo "PixelGuard - local startup"
+echo "=========================="
+
+# ---- Python venv ----
+if [ ! -d "backend/.venv" ]; then
+  echo "[1/4] Creating Python venv..."
+  python3 -m venv backend/.venv
 fi
 
-echo "✓ Docker found"
+# shellcheck disable=SC1091
+source backend/.venv/bin/activate
+pip install --quiet -r backend/requirements.txt
 
-# Check Docker Compose
-if ! command -v docker-compose &> /dev/null; then
-    echo "❌ Docker Compose is not installed"
-    exit 1
-fi
-
-echo "✓ Docker Compose found"
-
-# Create .env files if they don't exist
+# ---- .env ----
 if [ ! -f backend/.env ]; then
-    echo "Creating backend/.env..."
-    cp backend/.env.example backend/.env
+  cp backend/.env.example backend/.env
+  echo "[!] Created backend/.env from example — edit MONGODB_URL if needed."
 fi
 
-if [ ! -f frontend/.env ]; then
-    echo "Creating frontend/.env..."
-    cp frontend/.env.example frontend/.env
-fi
+# ---- Mongo indexes ----
+echo "[2/4] Ensuring MongoDB indexes..."
+python scripts/setup_db.py
 
-# Start services
-echo ""
-echo "Starting services..."
-docker-compose up -d
+# ---- Backend ----
+echo "[3/4] Starting FastAPI on :8000 ..."
+( cd backend && uvicorn app.main:app --reload --port 8000 ) &
+BACKEND_PID=$!
 
-# Wait for backend to be ready
-echo "Waiting for backend to be ready..."
-for i in {1..30}; do
-    if docker-compose exec backend curl -f http://localhost:8000/health > /dev/null 2>&1; then
-        echo "✓ Backend is ready"
-        break
-    fi
-    sleep 1
-done
+# ---- Frontend ----
+echo "[4/4] Installing & starting React on :3000 ..."
+( cd frontend && (npm install --silent && npm start) ) &
+FRONTEND_PID=$!
 
-# Initialize database
-echo "Initializing database..."
-docker-compose exec backend python scripts/setup_db.py
+trap "kill $BACKEND_PID $FRONTEND_PID 2>/dev/null" INT TERM EXIT
 
-echo ""
-echo "=========================================="
-echo "✓ PixelGuard is ready!"
 echo ""
 echo "Frontend: http://localhost:3000"
-echo "Backend:  http://localhost:8000"
-echo "Docs:     http://localhost:8000/docs"
+echo "Backend : http://localhost:8000"
+echo "Docs    : http://localhost:8000/docs"
 echo ""
-echo "To stop: docker-compose down"
+echo "Press Ctrl+C to stop."
+wait

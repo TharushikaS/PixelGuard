@@ -1,126 +1,177 @@
 # PixelGuard — Deployment Guide
 
-## Prerequisites
+PixelGuard runs as three independent pieces: a MongoDB database, a FastAPI backend, and a React frontend. You can host each one anywhere — managed services keep things simplest.
 
-- Docker + Docker Compose v2
-- (or) Python 3.10+, Node 18+, and a MongoDB instance
-- 4 GB RAM minimum for inference on CPU; 8 GB+ with an NVIDIA GPU for training
-- A domain + TLS cert for production (Let's Encrypt via nginx/Caddy)
+## Recommended production stack
 
----
+| Component       | Where to host                       | Cost (dev/demo) |
+|-----------------|-------------------------------------|-----------------|
+| Database        | **MongoDB Atlas** (free M0 cluster) | $0              |
+| Backend         | **Render** or **Railway** or **Fly.io** | free tier OK  |
+| Frontend        | **Vercel** or **Netlify**           | free            |
+| Trained weights | Commit to repo, or push to **Hugging Face Hub** / S3 | $0           |
 
-## Option A — Docker Compose (recommended for staging)
-
-```bash
-git clone <repo> pixelguard && cd pixelguard
-git checkout tharushika/dev          # or main once merged
-cp backend/.env.example backend/.env # tweak SECRET_KEY etc.
-
-docker compose up -d --build
-docker compose ps
-```
-
-Services:
-
-| Container               | Port  | Purpose                          |
-|-------------------------|-------|----------------------------------|
-| `pixelguard-mongo`      | 27017 | MongoDB 7                        |
-| `pixelguard-backend`    | 8000  | FastAPI + TensorFlow             |
-| `pixelguard-frontend`   | 3000  | React (served via `serve`)       |
-| `pixelguard-nginx` (opt)| 80/443| Reverse proxy (`--profile production`) |
-
-Indexes are created automatically by the backend on startup. To force a re-create or wipe the DB:
-
-```bash
-docker compose exec backend python /app/../scripts/setup_db.py --drop
-```
+This setup needs no Docker, no VM management, and no manual TLS — every service handles its own runtime.
 
 ---
 
-## Option B — Bare-metal / VM
+## 1. MongoDB Atlas
 
-### 1. MongoDB
+1. Sign up at <https://www.mongodb.com/cloud/atlas> and create an **M0** (free) cluster.
+2. Database Access → add a user with read/write on `pixelguard`.
+3. Network Access → allow `0.0.0.0/0` for the demo (or your backend's egress IP in prod).
+4. Connect → copy the SRV URL:
+   ```
+   mongodb+srv://USER:PASS@cluster0.xxx.mongodb.net
+   ```
+5. Set this as `MONGODB_URL` in your backend environment.
 
-Use MongoDB Atlas (managed) or self-host:
+The first time the backend starts against a fresh DB, `ensure_indexes()` creates every index it needs.
+
+---
+
+## 2. Backend on Render (example)
+
+Render auto-detects the FastAPI app from `backend/`.
+
+1. New Web Service → connect your repo → root `backend/`.
+2. Build command:
+   ```
+   pip install -r requirements.txt
+   ```
+3. Start command:
+   ```
+   uvicorn app.main:app --host 0.0.0.0 --port $PORT
+   ```
+4. Environment variables (Settings → Environment):
+
+   | Var                | Value                                          |
+   |--------------------|------------------------------------------------|
+   | `MONGODB_URL`      | (Atlas SRV URL)                                |
+   | `MONGODB_DB`       | `pixelguard`                                   |
+   | `SECRET_KEY`       | long random string                             |
+   | `ALLOWED_ORIGINS`  | `https://your-frontend.vercel.app`             |
+   | `DEBUG`            | `False`                                        |
+
+5. Use a paid plan (or persistent disk) if you want `./uploads` to survive restarts. **Better long-term**: swap the disk write in `app/routes/encode.py` for an S3 upload (the path field in MongoDB then stores the S3 URL).
+
+Railway and Fly.io work the same way — point at `backend/`, set env vars, deploy.
+
+### Production process settings
+
+For more throughput:
 
 ```bash
-# Self-hosted (Ubuntu 22.04, replica-set ready for prod)
-docker run -d --name mongo --restart unless-stopped \
-  -v mongo_data:/data/db -p 27017:27017 mongo:7
-```
-
-For Atlas, grab the SRV connection string and set:
-
-```env
-MONGODB_URL=mongodb+srv://USER:PASS@cluster0.xxx.mongodb.net
-MONGODB_DB=pixelguard
-```
-
-### 2. Backend
-
-```bash
-cd backend
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-
-# Production: gunicorn with uvicorn workers
 pip install gunicorn
 gunicorn app.main:app \
   --workers 4 \
   --worker-class uvicorn.workers.UvicornWorker \
-  --bind 0.0.0.0:8000 \
+  --bind 0.0.0.0:$PORT \
   --timeout 60
 ```
 
-For GPU inference, install `tensorflow[and-cuda]` instead of plain `tensorflow` and confirm with `python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"`.
+TensorFlow inference is CPU-bound; 4 workers on a 2 vCPU instance is usually a sweet spot.
 
-### 3. Frontend
-
-```bash
-cd frontend
-npm install
-npm run build
-# serve build/ via nginx, Cloudfront, Netlify, or `serve -s build -l 3000`
-```
-
-Set `REACT_APP_API_URL` to your public API hostname at build time.
+For GPU inference (much faster encoding), use a GPU host (Modal, Banana, RunPod) and install `tensorflow[and-cuda]` instead of plain `tensorflow`.
 
 ---
 
-## TLS & reverse proxy (nginx)
+## 3. Frontend on Vercel (example)
 
-`docker-compose.yml` defines an `nginx` service under the `production` profile. Drop a config in `./nginx.conf` like:
+1. Import the GitHub repo into Vercel.
+2. Root directory: `frontend/`.
+3. Framework preset: Create React App.
+4. Environment variable:
+   ```
+   REACT_APP_API_URL = https://your-backend.onrender.com
+   ```
+5. Deploy. Vercel auto-builds on every push.
+
+Netlify works identically (build command `npm run build`, publish dir `build/`).
+
+---
+
+## 4. Self-hosted on a single VM (Ubuntu 22.04)
+
+If you'd rather run everything on one box (a $5 droplet for the demo):
+
+```bash
+# --- prereqs ---
+sudo apt update
+sudo apt install -y python3.10 python3.10-venv nodejs npm nginx mongodb
+
+# --- pull the repo ---
+git clone <repo> /opt/pixelguard && cd /opt/pixelguard
+git checkout tharushika/dev
+
+# --- backend ---
+cd backend
+python3.10 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt gunicorn
+cp .env.example .env       # edit MONGODB_URL=mongodb://localhost:27017
+
+# Run as a systemd service (see /etc/systemd/system/pixelguard.service below)
+sudo systemctl enable --now pixelguard
+sudo systemctl enable --now mongod
+
+# --- frontend ---
+cd ../frontend
+npm install
+npm run build              # produces build/
+# Then point nginx at build/ (see nginx config below)
+```
+
+### `/etc/systemd/system/pixelguard.service`
+
+```ini
+[Unit]
+Description=PixelGuard FastAPI backend
+After=network.target mongod.service
+
+[Service]
+WorkingDirectory=/opt/pixelguard/backend
+EnvironmentFile=/opt/pixelguard/backend/.env
+ExecStart=/opt/pixelguard/backend/.venv/bin/gunicorn \
+  app.main:app \
+  --workers 4 \
+  --worker-class uvicorn.workers.UvicornWorker \
+  --bind 127.0.0.1:8000
+Restart=always
+User=www-data
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### `/etc/nginx/sites-available/pixelguard`
 
 ```nginx
-events {}
-http {
-  upstream backend  { server backend:8000;  }
-  upstream frontend { server frontend:3000; }
+server {
+  listen 80;
+  server_name pixelguard.example.com;
 
-  server {
-    listen 80;
-    server_name pixelguard.example.com;
-    return 301 https://$host$request_uri;
-  }
-  server {
-    listen 443 ssl http2;
-    server_name pixelguard.example.com;
-    ssl_certificate     /etc/letsencrypt/live/.../fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/.../privkey.pem;
+  client_max_body_size 50M;
 
-    client_max_body_size 50M;       # match MAX_UPLOAD_SIZE
-    location /api/    { proxy_pass http://backend; }
-    location /docs    { proxy_pass http://backend; }
-    location /health  { proxy_pass http://backend; }
-    location /        { proxy_pass http://frontend; }
+  # Frontend static build
+  root /opt/pixelguard/frontend/build;
+  index index.html;
+  location / {
+    try_files $uri /index.html;
   }
+
+  # Backend API
+  location /api/   { proxy_pass http://127.0.0.1:8000; }
+  location /docs   { proxy_pass http://127.0.0.1:8000; }
+  location /health { proxy_pass http://127.0.0.1:8000; }
 }
 ```
 
-Then:
+Add TLS with Certbot:
 
 ```bash
-docker compose --profile production up -d
+sudo apt install certbot python3-certbot-nginx
+sudo certbot --nginx -d pixelguard.example.com
 ```
 
 ---
@@ -132,9 +183,9 @@ docker compose --profile production up -d
 | `MONGODB_URL`             | `mongodb://localhost:27017`        | Connection string                      |
 | `MONGODB_DB`              | `pixelguard`                       | DB name                                |
 | `SECRET_KEY`              | `change-me-in-production`          | **Change in prod**                     |
-| `ALLOWED_ORIGINS`         | localhost dev origins              | Comma-separated                        |
+| `ALLOWED_ORIGINS`         | localhost dev origins              | Comma-separated list                   |
 | `MAX_UPLOAD_SIZE`         | `52428800` (50 MB)                 | Match nginx `client_max_body_size`     |
-| `UPLOAD_DIR`              | `./uploads`                        | Mount a persistent volume in prod      |
+| `UPLOAD_DIR`              | `./uploads`                        | Persistent disk path, or `/tmp` if S3  |
 | `MODEL_PATH`              | `./models`                         | Where trained weights live             |
 | `MESSAGE_LENGTH`          | `32`                               | Tracking-ID bit length                 |
 | `IMAGE_SIZE`              | `256`                              | Inference input size                   |
@@ -146,27 +197,24 @@ docker compose --profile production up -d
 
 ```bash
 # Should print {"status":"healthy",...}
-curl http://localhost:8000/health
+curl https://your-backend.example.com/health
 
-# Encode a sample
-curl -X POST http://localhost:8000/api/v1/encode/ \
+# Encode
+curl -X POST https://your-backend.example.com/api/v1/encode/ \
   -F file=@sample.jpg \
   -F owner_name="Test User" \
   -F owner_email="test@example.com"
 
-# Decode (use the encoded image you just got via /encode/download/{id})
-curl -X POST http://localhost:8000/api/v1/decode/ -F file=@encoded.png
+# Decode (use the file you downloaded from /encode/download/{id})
+curl -X POST https://your-backend.example.com/api/v1/decode/ -F file=@encoded.png
 ```
 
 ---
 
 ## Backups
 
-- **MongoDB**: schedule daily `mongodump` to S3 / GCS.
-  ```bash
-  mongodump --uri="$MONGODB_URL" --db=pixelguard --archive=/backups/pixelguard-$(date +%F).archive
-  ```
-- **Uploads**: sync `./uploads/` to object storage (preferred: store directly to S3 instead of disk in prod — swap `ImageProcessor.save_image` for an S3 client).
+- **MongoDB**: Atlas does this for you (continuous backup on M10+, daily snapshots on M0). Self-hosted: schedule daily `mongodump` to S3.
+- **Uploads**: if you keep them on disk, sync to object storage with `rclone`. Better: skip the disk entirely and upload directly to S3 from the encode route.
 
 ---
 
@@ -174,10 +222,9 @@ curl -X POST http://localhost:8000/api/v1/decode/ -F file=@encoded.png
 
 - [ ] Replace `SECRET_KEY` with a long random string
 - [ ] Restrict `ALLOWED_ORIGINS` to your frontend domain
-- [ ] Run behind HTTPS (nginx/Caddy/Cloudflare)
-- [ ] Use managed MongoDB (Atlas) or a replica-set
-- [ ] Mount `uploads/` to durable storage (or move to S3)
-- [ ] Train the model on COCO 2017 — out-of-the-box weights are random init
-- [ ] Set up monitoring (Prometheus + Grafana, or Datadog)
-- [ ] Configure log aggregation (Loki / ELK)
-- [ ] Add rate-limiting (nginx `limit_req` or FastAPI middleware)
+- [ ] Use Atlas (or a replica-set self-host) rather than a single Mongo node
+- [ ] Move `uploads/` to S3 / R2 / GCS for durability
+- [ ] Train the model on COCO 2017 — shipped weights are random init
+- [ ] Set up monitoring (UptimeRobot for free, or Datadog / Grafana Cloud)
+- [ ] Add rate-limiting (nginx `limit_req` or a FastAPI middleware)
+- [ ] Run the backend behind HTTPS (Render/Vercel give this free; nginx + Certbot for self-host)
