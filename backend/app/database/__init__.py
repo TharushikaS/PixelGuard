@@ -4,6 +4,7 @@ from .database import (
     connect_to_mongo,
     decoding_log_collection,
     encoded_collection,
+    ensure_connected,
     ensure_indexes,
     get_client,
     get_db,
@@ -14,6 +15,7 @@ from .database import (
 __all__ = [
     "connect_to_mongo",
     "close_mongo_connection",
+    "ensure_connected",
     "ensure_indexes",
     "get_client",
     "get_db",

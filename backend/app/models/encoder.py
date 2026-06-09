@@ -1,133 +1,147 @@
 """
-Encoder Network - FCN Architecture
-Embeds tracking ID into cover image
+HiDDeN Encoder — implementation faithful to:
+
+  Zhu, Kaplan, Johnson, Fei-Fei. "HiDDeN: Hiding Data with Deep Networks."
+  ECCV 2018.
+
+…with the extensions called out in our project proposal:
+
+  * Fully-Convolutional Network (resolution-agnostic — no dense layers in
+    the message-handling path; works on any H×W at inference time).
+  * Residual blocks for high-frequency preservation (PSNR > 40 dB target).
+  * Residual-output formulation: the encoder predicts a small additive
+    perturbation `delta`, and  I_en = clip(I_co + α · delta, 0, 1).
+    This trains far more stably than learning the full stego image from
+    scratch, and matches what most HiDDeN reimplementations do.
+
+The message is treated as a "global statistical bias dispersed throughout
+the image" — every spatial location sees the full message via spatial
+replication, then convolutions decide how to thread it into the textures.
 """
+from __future__ import annotations
+
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
-import numpy as np
 
 
+# ---------------------------------------------------------------------------
+# Conv block + Residual block
+# ---------------------------------------------------------------------------
+class ConvBNReLU(layers.Layer):
+    """3×3 conv → BN → ReLU. The building block used throughout."""
+
+    def __init__(self, channels: int, kernel: int = 3, **kw):
+        super().__init__(**kw)
+        self.conv = layers.Conv2D(channels, kernel, padding="same", use_bias=False)
+        self.bn = layers.BatchNormalization()
+        self.act = layers.ReLU()
+
+    def call(self, x, training=False):
+        return self.act(self.bn(self.conv(x), training=training))
+
+
+class ResidualBlock(layers.Layer):
+    """Standard residual block: x + Conv(BN(Conv(BN(x))))."""
+
+    def __init__(self, channels: int, **kw):
+        super().__init__(**kw)
+        self.conv1 = ConvBNReLU(channels)
+        self.conv2 = layers.Conv2D(channels, 3, padding="same", use_bias=False)
+        self.bn2 = layers.BatchNormalization()
+
+    def call(self, x, training=False):
+        h = self.conv1(x, training=training)
+        h = self.bn2(self.conv2(h), training=training)
+        return tf.nn.relu(x + h)
+
+
+# ---------------------------------------------------------------------------
+# Encoder
+# ---------------------------------------------------------------------------
 class Encoder(keras.Model):
     """
-    Fully Convolutional Encoder Network
-    Embeds a binary message into a cover image
-    
-    Architecture:
-    - Conv blocks to extract image features
-    - Message projection and spatial replication
-    - Residual blocks for deep embedding
-    - Output: Encoded image (stego image)
+    Inputs:
+        cover   — (B, H, W, 3) image in [0, 1]
+        message — (B, L) binary bits (float32, 0.0 or 1.0)
+
+    Output:
+        stego   — (B, H, W, 3) image in [0, 1], visually close to `cover`
+
+    Architecture (paper-faithful with proposal's residual extension):
+
+        cover  ──► ConvBNReLU(C)
+                         │ image feats (B, H, W, C)
+        message ──► tile to (B, H, W, L)
+                         │
+                concat (cover + image_feats + msg_volume)
+                         │
+                1×1 fuse conv  ──►  (B, H, W, C)
+                         │
+                ResidualBlock × N
+                         │
+                1×1 conv → 3 channels, tanh
+                         │
+                delta ∈ [-1, 1]
+                         │
+                stego = clip(cover + α · delta, 0, 1)
     """
-    
-    def __init__(self, message_length=32, image_channels=3):
-        super(Encoder, self).__init__()
-        self.message_length = message_length
-        self.image_channels = image_channels
-        
-        # Initial conv blocks
-        self.conv1 = layers.Conv2D(64, (3, 3), padding='same', activation='relu')
-        self.bn1 = layers.BatchNormalization()
-        
-        self.conv2 = layers.Conv2D(128, (3, 3), padding='same', activation='relu')
-        self.bn2 = layers.BatchNormalization()
-        
-        # Message processing
-        self.message_dense = layers.Dense(256, activation='relu')
-        self.message_projection = layers.Dense(16 * 16)  # Multi-channel tensor
-        
-        # 1x1 projection after image+message concatenation, so the residual
-        # blocks see a consistent channel count.
-        self.fuse_projection = layers.Conv2D(128, (1, 1), padding='same', activation='relu')
 
-        # Residual blocks (4 blocks)
-        self.residual_blocks = self._build_residual_blocks()
+    def __init__(
+        self,
+        message_length: int = 32,
+        conv_channels: int = 64,
+        num_residual_blocks: int = 4,
+        perturbation_scale: float = 0.1,
+    ):
+        super().__init__()
+        self.L = message_length
+        self.perturbation_scale = perturbation_scale
 
-        # Output conv -- sigmoid keeps stego image in [0,1] like the cover
-        self.output_conv = layers.Conv2D(
-            image_channels, (3, 3), padding='same', activation='sigmoid'
+        # Image feature extraction (kept at full resolution — FCN style)
+        self.image_conv = ConvBNReLU(conv_channels)
+
+        # 1×1 projection after concat (cover + img_feats + msg_volume → conv_channels)
+        self.fuse = layers.Conv2D(
+            conv_channels, 1, padding="same", activation="relu"
         )
-    
-    def _build_residual_blocks(self, num_blocks=4):
-        """Build residual blocks for deep feature learning"""
-        blocks = []
-        for _ in range(num_blocks):
-            blocks.append(ResidualBlock(128))
-        return blocks
-    
-    def call(self, inputs, training=False):
-        """
-        Forward pass
-        inputs: (cover_image, message) tuple
-            - cover_image: (batch, height, width, 3)
-            - message: (batch, message_length) one-hot or binary
-        """
-        cover_image, message = inputs
-        
-        # Get spatial dimensions
-        batch_size = tf.shape(cover_image)[0]
-        height = tf.shape(cover_image)[1]
-        width = tf.shape(cover_image)[2]
-        
-        # Extract image features
-        x = self.conv1(cover_image)
-        x = self.bn1(x, training=training)
-        
-        x = self.conv2(x)
-        x = self.bn2(x, training=training)
-        
-        # Process message
-        msg_feat = self.message_dense(message)  # (batch, 256)
-        msg_feat = self.message_projection(msg_feat)  # (batch, 256)
-        
-        # Reshape message to multi-channel tensor
-        msg_feat = tf.reshape(msg_feat, (batch_size, 16, 16, 1))
-        
-        # Resize message to match image spatial dimensions
-        msg_feat = tf.image.resize(msg_feat, (height, width))
-        
-        # Tile to match feature channels
-        msg_feat = tf.tile(msg_feat, (1, 1, 1, tf.shape(x)[-1]))
-        
-        # Concatenate message with image features and project back to 128 ch
-        x = tf.concat([x, msg_feat], axis=-1)
-        x = self.fuse_projection(x)
 
-        # Residual blocks
+        # Residual stack — learns the embedding
+        self.residual_blocks = [
+            ResidualBlock(conv_channels) for _ in range(num_residual_blocks)
+        ]
+
+        # Predict the residual / perturbation. tanh keeps it in [-1, 1].
+        self.delta_conv = layers.Conv2D(3, 1, padding="same", activation="tanh")
+
+    def call(self, inputs, training=False):
+        cover, message = inputs
+
+        B = tf.shape(cover)[0]
+        H = tf.shape(cover)[1]
+        W = tf.shape(cover)[2]
+
+        # ---- image features ----
+        img_feats = self.image_conv(cover, training=training)
+
+        # ---- message volume: replicate the L bits at every (h, w) ----
+        # message: (B, L) → (B, 1, 1, L) → tile to (B, H, W, L)
+        msg = tf.reshape(message, (B, 1, 1, self.L))
+        msg_vol = tf.tile(msg, (1, H, W, 1))
+
+        # ---- fuse cover + image features + message volume ----
+        x = tf.concat([cover, img_feats, msg_vol], axis=-1)
+        x = self.fuse(x)
+
+        # ---- residual stack ----
         for block in self.residual_blocks:
             x = block(x, training=training)
-        
-        # Output encoding
-        encoded = self.output_conv(x)
-        
-        # Ensure output is same shape as input
-        encoded = tf.image.resize(encoded, (height, width))
-        
-        return encoded
 
+        # ---- predict the small additive perturbation ----
+        delta = self.delta_conv(x)              # (B, H, W, 3), values in [-1, 1]
 
-class ResidualBlock(keras.Model):
-    """Residual block for deep feature learning"""
-    
-    def __init__(self, filters=128):
-        super(ResidualBlock, self).__init__()
-        self.conv1 = layers.Conv2D(filters, (3, 3), padding='same', activation='relu')
-        self.bn1 = layers.BatchNormalization()
-        self.conv2 = layers.Conv2D(filters, (3, 3), padding='same')
-        self.bn2 = layers.BatchNormalization()
-        self.activation = layers.ReLU()
-    
-    def call(self, x, training=False):
-        residual = x
-        
-        # Conv path
-        out = self.conv1(x)
-        out = self.bn1(out, training=training)
-        out = self.conv2(out)
-        out = self.bn2(out, training=training)
-        
-        # Add residual connection
-        out = layers.Add()([out, residual])
-        out = self.activation(out)
-        
-        return out
+        # ---- compose stego image ----
+        stego = tf.clip_by_value(
+            cover + self.perturbation_scale * delta, 0.0, 1.0
+        )
+        return stego

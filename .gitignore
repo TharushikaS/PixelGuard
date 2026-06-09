@@ -64,7 +64,9 @@ dist/
 .env
 .env.local
 /uploads/
+backend/uploads/
 /models/
+backend/models/
 logs/
 *.db
 *.sqlite

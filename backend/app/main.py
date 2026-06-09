@@ -38,13 +38,18 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# CORS: explicit origins from settings, plus a regex catch-all for
+# any localhost / 127.0.0.1 port when DEBUG=True. Prod stays strict.
+_cors_kwargs = {
+    "allow_origins": settings.ALLOWED_ORIGINS,
+    "allow_credentials": True,
+    "allow_methods": ["*"],
+    "allow_headers": ["*"],
+}
+if settings.DEBUG:
+    _cors_kwargs["allow_origin_regex"] = r"https?://(localhost|127\.0\.0\.1)(:\d+)?"
+
+app.add_middleware(CORSMiddleware, **_cors_kwargs)
 
 
 # ---------------------------------------------------------------------------

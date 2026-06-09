@@ -4,20 +4,25 @@ from __future__ import annotations
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from app.config import settings
+from app.database import ensure_connected
 from app.database.schemas import DecodeResponse
-from app.services import SteganographyService, TrackingService
+from app.services import TrackingService, get_stego_service
 from app.utils import ImageProcessor
 
 router = APIRouter(prefix=f"{settings.API_V1_STR}/decode", tags=["decode"])
 
-_stego: SteganographyService | None = None
+_stego = None
 
 
-def _get_stego() -> SteganographyService:
+def _get_stego():
     global _stego
     if _stego is None:
-        _stego = SteganographyService()
+        _stego = get_stego_service()
     return _stego
+
+
+def _input_size() -> int | None:
+    return None if settings.STEGO_METHOD.lower() == "lsb" else settings.IMAGE_SIZE
 
 
 @router.post("/", response_model=DecodeResponse)
@@ -37,9 +42,7 @@ async def decode_image(file: UploadFile = File(...)):
         raise HTTPException(status_code=413, detail="File too large.")
 
     try:
-        encoded_image = ImageProcessor.load_image_from_bytes(
-            contents, settings.IMAGE_SIZE
-        )
+        encoded_image = ImageProcessor.load_image_from_bytes(contents, _input_size())
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"Image decode failed: {exc}")
 
@@ -47,6 +50,7 @@ async def decode_image(file: UploadFile = File(...)):
     decoded_id, metrics = stego.decode(encoded_image)
     confidence = float(metrics.get("confidence", 0.0))
 
+    await ensure_connected()
     record = await TrackingService.get_tracking_id(decoded_id)
     found = record is not None and record.get("is_active", False)
 
@@ -90,7 +94,7 @@ async def decode_with_distortion(
     if not contents:
         raise HTTPException(status_code=400, detail="Empty upload.")
 
-    encoded_image = ImageProcessor.load_image_from_bytes(contents, settings.IMAGE_SIZE)
+    encoded_image = ImageProcessor.load_image_from_bytes(contents, _input_size())
     stego = _get_stego()
     tracking_id, metrics = stego.decode(encoded_image, apply_noise=distortion_type)
 

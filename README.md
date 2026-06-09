@@ -168,12 +168,20 @@ Full schemas and examples: `/docs` (Swagger UI) or `/redoc`.
 
 ## Training the model
 
+A complete step-by-step guide (Google Colab + COCO 2017 + GPU) lives at
+[`docs/TRAINING.md`](docs/TRAINING.md). Short version:
+
 ```bash
-# Default: 10 epochs on synthetic data — for smoke testing only.
-python scripts/train_model.py --epochs 50 --batch-size 16 --model-path ./models
+python scripts/train_model.py \
+    --image-dir /path/to/coco/train2017 \
+    --image-size 128 --message-length 32 \
+    --batch-size 12 --epochs 200 \
+    --model-dir ./models
 ```
 
-For real performance, plug COCO 2017 into `scripts/train_model.py` (see the docstring inside) and train for ≥ 200 epochs as in the original HiDDeN paper.
+After training, copy `models/` into the project root, set
+`STEGO_METHOD=neural` in `backend/.env`, and restart uvicorn. The same
+`/encode` and `/decode` endpoints now serve the robust neural watermark.
 
 ## Deployment
 

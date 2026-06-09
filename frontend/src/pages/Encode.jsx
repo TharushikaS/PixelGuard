@@ -2,8 +2,9 @@
  * Encode Page - Image Encoding Interface
  */
 import React, { useState, useCallback } from 'react';
+import { Link } from 'react-router-dom';
 import { useDropzone } from 'react-dropzone';
-import { encodeImage } from '../services/api';
+import { encodeImage, buildAbsoluteUrl } from '../services/api';
 import LoadingSpinner from '../components/LoadingSpinner';
 
 const Encode = () => {
@@ -213,7 +214,9 @@ const Encode = () => {
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '1rem' }}>
             <div>
               <p style={{ color: '#6c757d', fontSize: '0.875rem' }}>Tracking ID</p>
-              <p style={{ fontSize: '1.125rem', fontWeight: 'bold' }}>{result.tracking_id}</p>
+              <p style={{ fontSize: '1rem', fontWeight: 'bold', fontFamily: 'monospace', wordBreak: 'break-all' }}>
+                {result.tracking_id}
+              </p>
             </div>
             <div>
               <p style={{ color: '#6c757d', fontSize: '0.875rem' }}>PSNR</p>
@@ -229,11 +232,53 @@ const Encode = () => {
             </div>
           </div>
 
-          <div style={{ marginTop: '1rem' }}>
-            <a href={result.encoded_image_url} className="btn btn-primary">
-              Download Encoded Image
-            </a>
+          {/* Encoded image preview */}
+          <div style={{ marginTop: '1.5rem' }}>
+            <p style={{ color: '#6c757d', fontSize: '0.875rem', marginBottom: '0.5rem' }}>
+              Stamped image
+            </p>
+            <img
+              src={buildAbsoluteUrl(result.encoded_image_url || result.download_url)}
+              alt="Encoded"
+              style={{
+                maxWidth: '100%',
+                maxHeight: '320px',
+                borderRadius: '0.5rem',
+                border: '1px solid #dee2e6',
+              }}
+            />
           </div>
+
+          {/* Action buttons */}
+          <div style={{ marginTop: '1.5rem', display: 'flex', gap: '0.75rem', flexWrap: 'wrap' }}>
+            <a
+              href={buildAbsoluteUrl(result.download_url || result.encoded_image_url)}
+              download={`pixelguard-${result.tracking_id}.png`}
+              className="btn btn-primary"
+            >
+              ⬇ Download Encoded Image
+            </a>
+            <Link
+              to={`/decode?tracking_id=${result.tracking_id}`}
+              className="btn btn-outline"
+            >
+              🔍 Track This Image
+            </Link>
+            <button
+              onClick={() => {
+                navigator.clipboard.writeText(result.tracking_id);
+              }}
+              className="btn btn-outline"
+              type="button"
+            >
+              📋 Copy Tracking ID
+            </button>
+          </div>
+
+          <p style={{ marginTop: '1rem', color: '#6c757d', fontSize: '0.875rem' }}>
+            Save the file above and re-upload it on the <Link to="/decode">Track</Link> page
+            to verify the embedded ID can be recovered.
+          </p>
         </div>
       )}
 

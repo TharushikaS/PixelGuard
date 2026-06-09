@@ -33,19 +33,22 @@ class MetricsCalculator:
         Range: [-1, 1], 1 = identical
         >0.98 is good for imperceptibility
         """
-        # Ensure values are in [0, 1]
+        # Ensure values are in [0, 1] floats
+        original = original.astype(np.float32)
+        distorted = distorted.astype(np.float32)
         if original.max() > 1:
             original = original / 255.0
         if distorted.max() > 1:
             distorted = distorted / 255.0
-        
+
         # Convert to grayscale if color
-        if len(original.shape) == 3:
+        if original.ndim == 3:
             original = np.mean(original, axis=2)
-        if len(distorted.shape) == 3:
+        if distorted.ndim == 3:
             distorted = np.mean(distorted, axis=2)
-        
-        ssim = structural_similarity(original, distorted)
+
+        # data_range is REQUIRED in skimage >= 0.21 for float images.
+        ssim = structural_similarity(original, distorted, data_range=1.0)
         return float(ssim)
     
     @staticmethod

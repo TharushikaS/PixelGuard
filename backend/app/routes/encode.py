@@ -8,21 +8,27 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
 from app.config import settings
+from app.database import ensure_connected
 from app.database.schemas import EncodeResponse
-from app.services import SteganographyService, TrackingService
+from app.services import TrackingService, get_stego_service
 from app.utils import ImageProcessor
 
 router = APIRouter(prefix=f"{settings.API_V1_STR}/encode", tags=["encode"])
 
 # Lazily-initialized; first request triggers model construction.
-_stego: SteganographyService | None = None
+_stego = None
 
 
-def _get_stego() -> SteganographyService:
+def _get_stego():
     global _stego
     if _stego is None:
-        _stego = SteganographyService()
+        _stego = get_stego_service()
     return _stego
+
+
+def _input_size() -> int | None:
+    """Neural path needs fixed-size input; LSB keeps native resolution."""
+    return None if settings.STEGO_METHOD.lower() == "lsb" else settings.IMAGE_SIZE
 
 
 @router.post("/", response_model=EncodeResponse)
@@ -57,11 +63,9 @@ async def encode_image(
     if ext and ext not in settings.ALLOWED_EXTENSIONS:
         raise HTTPException(status_code=415, detail=f"Unsupported file type: .{ext}")
 
-    # ---- 2. decode cover ----
+    # ---- 2. decode cover (LSB keeps native resolution, neural resizes) ----
     try:
-        cover_image = ImageProcessor.load_image_from_bytes(
-            contents, settings.IMAGE_SIZE
-        )
+        cover_image = ImageProcessor.load_image_from_bytes(contents, _input_size())
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"Image decode failed: {exc}")
 
@@ -73,6 +77,7 @@ async def encode_image(
     # ---- 4. persist metadata FIRST so a partial failure later leaves a
     # record we can debug.
     try:
+        await ensure_connected()
         await TrackingService.create_tracking_id(
             tracking_id=tracking_id,
             owner_name=owner_name,
@@ -149,7 +154,7 @@ async def test_robustness(
     if not contents:
         raise HTTPException(status_code=400, detail="Empty upload.")
 
-    cover_image = ImageProcessor.load_image_from_bytes(contents, settings.IMAGE_SIZE)
+    cover_image = ImageProcessor.load_image_from_bytes(contents, _input_size())
     stego = _get_stego()
     if not tracking_id:
         tracking_id = stego.generate_tracking_id()

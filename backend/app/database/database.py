@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 class _MongoState:
     client: Optional[AsyncIOMotorClient] = None
     db: Optional[AsyncIOMotorDatabase] = None
+    last_error: Optional[str] = None  # remembered if connect() failed at startup
 
 
 _state = _MongoState()
@@ -40,20 +41,42 @@ async def connect_to_mongo() -> None:
     if _state.client is not None:
         return
 
-    logger.info("Connecting to MongoDB at %s", settings.MONGODB_URL)
-    _state.client = AsyncIOMotorClient(
-        settings.MONGODB_URL,
-        serverSelectionTimeoutMS=5000,
-        uuidRepresentation="standard",
-    )
-    _state.db = _state.client[settings.MONGODB_DB]
+    # Log the URL with the password masked so we never leak secrets.
+    masked = settings.MONGODB_URL
+    if "@" in masked and "://" in masked:
+        scheme, rest = masked.split("://", 1)
+        creds, host = rest.split("@", 1)
+        if ":" in creds:
+            user, _ = creds.split(":", 1)
+            masked = f"{scheme}://{user}:***@{host}"
+    logger.info("Connecting to MongoDB at %s", masked)
+
+    # AsyncIOMotorClient construction can throw on a malformed URL --
+    # capture that too, not just the ping failure.
+    try:
+        _state.client = AsyncIOMotorClient(
+            settings.MONGODB_URL,
+            serverSelectionTimeoutMS=5000,
+            uuidRepresentation="standard",
+        )
+        _state.db = _state.client[settings.MONGODB_DB]
+    except Exception as exc:  # noqa: BLE001
+        logger.error("MongoDB client construction failed: %s", exc)
+        _state.last_error = f"client construction: {exc}"
+        _state.client = None
+        _state.db = None
+        raise
 
     # Force a round-trip so we fail fast if Mongo is unreachable.
     try:
         await _state.client.admin.command("ping")
         logger.info("MongoDB connection OK (db=%s)", settings.MONGODB_DB)
-    except PyMongoError as exc:
+        _state.last_error = None
+    except Exception as exc:  # noqa: BLE001
         logger.error("MongoDB ping failed: %s", exc)
+        _state.last_error = f"ping: {exc}"
+        _state.client = None
+        _state.db = None
         raise
 
     await ensure_indexes()
@@ -68,18 +91,43 @@ async def close_mongo_connection() -> None:
         logger.info("MongoDB connection closed")
 
 
+async def ensure_connected() -> None:
+    """
+    If startup connection failed (transient DNS, network blip), retry now.
+    Routes/services call this before touching the DB so a single bad
+    moment at startup doesn't poison the whole server lifetime.
+    """
+    if _state.db is not None:
+        return
+    logger.info("Mongo not connected — retrying connection on demand")
+    await connect_to_mongo()
+
+
 # ---------------------------------------------------------------------------
 # Accessors
 # ---------------------------------------------------------------------------
+def _conn_error_hint() -> str:
+    if _state.last_error:
+        return (
+            f"MongoDB connection failed at startup. Last error: {_state.last_error}. "
+            "Check MONGODB_URL in backend/.env — make sure it's your real Atlas URL "
+            "(not the example placeholder) and the password is URL-safe."
+        )
+    return (
+        "MongoDB is not connected. Either the server lifespan hasn't run yet, or "
+        "MONGODB_URL is misconfigured. Check backend/.env and restart uvicorn."
+    )
+
+
 def get_client() -> AsyncIOMotorClient:
     if _state.client is None:
-        raise RuntimeError("MongoDB client is not initialized; call connect_to_mongo() first.")
+        raise RuntimeError(_conn_error_hint())
     return _state.client
 
 
 def get_db() -> AsyncIOMotorDatabase:
     if _state.db is None:
-        raise RuntimeError("MongoDB database is not initialized; call connect_to_mongo() first.")
+        raise RuntimeError(_conn_error_hint())
     return _state.db
 
 

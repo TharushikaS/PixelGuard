@@ -1,216 +1,209 @@
-"""Steganography service - core encoding/decoding logic"""
+"""
+Neural-network steganography service — uses the trained HiDDeN-style
+encoder/decoder to embed and recover a 32-bit tracking ID inside an image.
+
+The encoder operates on float images in [0, 1] of shape (H, W, 3) at the
+training resolution (default 128×128). The tracking ID is converted to a
+32-bit bitstring; the decoder predicts those bits back.
+
+This service is selected when STEGO_METHOD=neural in the .env. Until you
+train the model (and place weights under MODEL_PATH), the network runs
+with random weights and will not produce useful results — the LSB service
+is the safe demo default.
+"""
+from __future__ import annotations
+
+import os
+from typing import Any, Dict, Tuple
+
 import numpy as np
-import uuid
-from typing import Tuple, Dict, Any
-from app.models import Encoder, Decoder, Discriminator
-from app.utils import ImageProcessor, MetricsCalculator, NoiseProcessor
+import tensorflow as tf
+
 from app.config import settings
+from app.models import Decoder, Encoder
+from app.utils import MetricsCalculator
 
 
+# ---------------------------------------------------------------------------
+# Helpers: tracking-ID  ↔  32-bit array
+# ---------------------------------------------------------------------------
+def _tracking_id_to_bits(tracking_id: str, n_bits: int) -> np.ndarray:
+    """
+    Map an 8-hex-char tracking ID (or any hex string) into an n_bits bit array.
+    Right-pads with zeros if shorter; truncates if longer.
+    """
+    # Treat the hex string as an integer.
+    try:
+        value = int(tracking_id, 16)
+    except ValueError:
+        # Fall back: use the int hash of the string.
+        value = abs(hash(tracking_id)) & ((1 << n_bits) - 1)
+    bits = np.zeros(n_bits, dtype=np.float32)
+    for i in range(n_bits):
+        bits[n_bits - 1 - i] = (value >> i) & 1
+    return bits
+
+
+def _bits_to_tracking_id(bits: np.ndarray) -> str:
+    """Inverse of _tracking_id_to_bits — produce a hex string."""
+    value = 0
+    for b in bits:
+        value = (value << 1) | int(b > 0.5)
+    n_hex = (bits.size + 3) // 4
+    return f"{value:0{n_hex}x}"
+
+
+# ---------------------------------------------------------------------------
+# Service
+# ---------------------------------------------------------------------------
 class SteganographyService:
-    """Service for encoding/decoding images with steganography"""
-    
+    """Trained neural encoder/decoder. Same interface as LSBSteganographyService."""
+
     def __init__(self):
-        self.encoder = Encoder(message_length=settings.MESSAGE_LENGTH)
-        self.decoder = Decoder(message_length=settings.MESSAGE_LENGTH)
-        self.discriminator = Discriminator()
-        
-        # Try to load pretrained models
-        self._load_models()
-    
-    def _load_models(self):
-        """Load pretrained models if available. Fails silently in dev."""
-        import os
-        encoder_path = os.path.join(settings.MODEL_PATH, "encoder")
-        decoder_path = os.path.join(settings.MODEL_PATH, "decoder")
+        self.message_length = settings.MESSAGE_LENGTH
+        self.image_size = settings.IMAGE_SIZE
+
+        self.encoder = Encoder(message_length=self.message_length)
+        self.decoder = Decoder(message_length=self.message_length)
+
+        # Force a build so weight files can be loaded against a known shape.
+        dummy_cover = tf.zeros((1, self.image_size, self.image_size, 3))
+        dummy_msg = tf.zeros((1, self.message_length))
+        _ = self.encoder([dummy_cover, dummy_msg], training=False)
+        _ = self.decoder(dummy_cover, training=False)
+
+        self._loaded = self._load_weights()
+
+    # ------------------------------------------------------------------
+    # Weight management
+    # ------------------------------------------------------------------
+    def _load_weights(self) -> bool:
+        enc_path = os.path.join(settings.MODEL_PATH, "encoder")
+        dec_path = os.path.join(settings.MODEL_PATH, "decoder")
         try:
-            if os.path.exists(encoder_path + ".index") or os.path.exists(encoder_path):
-                self.encoder.load_weights(encoder_path)
-            if os.path.exists(decoder_path + ".index") or os.path.exists(decoder_path):
-                self.decoder.load_weights(decoder_path)
-            print("[stego] pretrained weights loaded (if present)")
+            # TF saves checkpoints as <prefix>.index + <prefix>.data-*
+            if os.path.exists(enc_path + ".index"):
+                self.encoder.load_weights(enc_path)
+                print(f"[stego/neural] loaded encoder from {enc_path}")
+            else:
+                print(f"[stego/neural] no encoder weights at {enc_path} (random init)")
+            if os.path.exists(dec_path + ".index"):
+                self.decoder.load_weights(dec_path)
+                print(f"[stego/neural] loaded decoder from {dec_path}")
+            else:
+                print(f"[stego/neural] no decoder weights at {dec_path} (random init)")
+            return True
         except Exception as exc:  # noqa: BLE001
-            print(f"[stego] no pretrained weights ({exc}); using random init")
-    
+            print(f"[stego/neural] weight load failed: {exc}")
+            return False
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
     def generate_tracking_id(self) -> str:
-        """Generate a unique tracking ID"""
-        return str(uuid.uuid4())[:16]  # 128-bit UUID truncated
-    
-    def message_to_binary(self, message: str) -> np.ndarray:
         """
-        Convert message string to binary array
-        Truncated to MESSAGE_LENGTH bits
+        Generate an N/4-hex-char tracking ID where N = MESSAGE_LENGTH bits.
+        E.g. 32 bits → 8 hex chars.
         """
-        # Convert string to bytes
-        message_bytes = message.encode('utf-8')
-        
-        # Convert to binary
-        binary_str = ''.join(format(byte, '08b') for byte in message_bytes)
-        
-        # Truncate/pad to MESSAGE_LENGTH
-        if len(binary_str) < settings.MESSAGE_LENGTH:
-            binary_str = binary_str + '0' * (settings.MESSAGE_LENGTH - len(binary_str))
-        else:
-            binary_str = binary_str[:settings.MESSAGE_LENGTH]
-        
-        # Convert to array
-        binary_array = np.array([int(b) for b in binary_str], dtype=np.float32)
-        
-        return binary_array
-    
-    def binary_to_message(self, binary_array: np.ndarray) -> str:
-        """Convert binary array back to message"""
-        # Round to 0/1
-        binary_ints = (binary_array > 0.5).astype(int)
-        
-        # Convert to string
-        binary_str = ''.join(str(b) for b in binary_ints)
-        
-        # Split into bytes
-        message_bytes = bytes(int(binary_str[i:i+8], 2) for i in range(0, len(binary_str), 8))
-        
-        # Decode to string (ignore errors)
-        message = message_bytes.decode('utf-8', errors='ignore')
-        
-        return message.rstrip('\x00')
-    
+        n_hex = self.message_length // 4
+        # Random N-bit integer rendered as hex.
+        value = int.from_bytes(os.urandom((self.message_length + 7) // 8), "big")
+        value &= (1 << self.message_length) - 1
+        return f"{value:0{n_hex}x}"
+
     def encode(
         self,
         cover_image: np.ndarray,
         tracking_id: str,
     ) -> Tuple[np.ndarray, Dict[str, Any]]:
         """
-        Encode tracking ID into cover image
-        
-        Args:
-            cover_image: Original image (H x W x 3) in [0, 1]
-            tracking_id: Message to encode
-        
-        Returns:
-            encoded_image: Stego image (H x W x 3)
-            metrics: PSNR, SSIM, etc.
+        cover_image: (H, W, 3), float in [0, 1] OR uint8.
+        Returns the stego image (same dtype family as input — float [0,1] preferred).
         """
-        # Convert message to binary
-        message_binary = self.message_to_binary(tracking_id)
-        
-        # Add batch dimension
-        cover_batch = np.expand_dims(cover_image, 0)  # (1, H, W, 3)
-        message_batch = np.expand_dims(message_binary, 0)  # (1, MESSAGE_LENGTH)
-        
-        # Encode
-        encoded_batch = self.encoder([cover_batch, message_batch], training=False)
-        encoded_image = np.squeeze(encoded_batch, 0)
-        
-        # Ensure output is valid
-        encoded_image = np.clip(encoded_image, 0, 1)
-        
-        # Calculate metrics
-        psnr = MetricsCalculator.calculate_psnr(cover_image, encoded_image)
-        ssim = MetricsCalculator.calculate_ssim(cover_image, encoded_image)
-        
+        # Coerce to float32 [0, 1]
+        was_uint8 = (cover_image.dtype == np.uint8)
+        x = cover_image.astype(np.float32)
+        if was_uint8 or x.max() > 1.5:
+            x = x / 255.0
+
+        # Resize to the training resolution. The network is technically FCN,
+        # but it's been trained at one resolution, so we honor that.
+        if x.shape[0] != self.image_size or x.shape[1] != self.image_size:
+            x = tf.image.resize(x, (self.image_size, self.image_size)).numpy()
+
+        bits = _tracking_id_to_bits(tracking_id, self.message_length)
+        cover_b = x[np.newaxis, ...]                          # (1, H, W, 3)
+        bits_b = bits[np.newaxis, ...]                        # (1, L)
+
+        stego = self.encoder([cover_b, bits_b], training=False).numpy()[0]
+        stego = np.clip(stego, 0.0, 1.0)
+
+        psnr = MetricsCalculator.calculate_psnr(x, stego)
+        ssim = MetricsCalculator.calculate_ssim(x, stego)
         metrics = {
-            'tracking_id': tracking_id,
-            'psnr': round(psnr, 2),
-            'ssim': round(ssim, 4),
-            'mse': round(MetricsCalculator.calculate_mse(cover_image, encoded_image), 6),
-            'mae': round(MetricsCalculator.calculate_mae(cover_image, encoded_image), 6),
+            "tracking_id": tracking_id,
+            "psnr": round(float(psnr), 2),
+            "ssim": round(float(ssim), 4),
+            "method": "neural",
+            "weights_loaded": self._loaded,
         }
-        
-        return encoded_image, metrics
-    
+        return stego, metrics
+
     def decode(
         self,
         encoded_image: np.ndarray,
-        apply_noise: str = None,
+        apply_noise: str | None = None,   # unused; kept for interface parity
     ) -> Tuple[str, Dict[str, Any]]:
-        """
-        Decode tracking ID from (possibly distorted) image
-        
-        Args:
-            encoded_image: Stego image (H x W x 3)
-            apply_noise: Optional noise type to apply before decoding
-        
-        Returns:
-            tracking_id: Recovered message
-            metrics: Confidence, etc.
-        """
-        # Apply noise if specified
-        if apply_noise:
-            processor = NoiseProcessor()
-            if apply_noise == 'jpeg':
-                encoded_image = processor.apply_jpeg_compression(encoded_image, quality=75)
-            elif apply_noise == 'blur':
-                encoded_image = processor.apply_gaussian_blur(encoded_image)
-            elif apply_noise == 'crop':
-                encoded_image = processor.apply_crop(encoded_image, 0.8)
-            elif apply_noise == 'resize':
-                encoded_image = processor.apply_resize(encoded_image)
-        
-        # Ensure image is in valid range
-        encoded_image = np.clip(encoded_image, 0, 1)
-        
-        # Add batch dimension
-        image_batch = np.expand_dims(encoded_image, 0)  # (1, H, W, 3)
-        
-        # Decode
-        message_batch = self.decoder(image_batch, training=False)
-        message_binary = np.squeeze(message_batch, 0)
-        
-        # Convert to tracking ID
-        tracking_id = self.binary_to_message(message_binary)
-        
-        # Calculate confidence
-        confidence = np.mean(np.abs(message_binary - 0.5)) * 2  # 0 to 1
-        confidence = min(confidence * 100, 100)  # Convert to percentage
-        
-        metrics = {
-            'tracking_id': tracking_id,
-            'confidence': round(confidence, 2),
-            'bit_accuracy': round(MetricsCalculator.calculate_bit_accuracy(
-                np.round(message_binary), message_binary
-            ), 2),
+        x = encoded_image.astype(np.float32)
+        if x.max() > 1.5:
+            x = x / 255.0
+        if x.shape[0] != self.image_size or x.shape[1] != self.image_size:
+            x = tf.image.resize(x, (self.image_size, self.image_size)).numpy()
+
+        logits = self.decoder(x[np.newaxis, ...], training=False).numpy()[0]
+        probs = 1.0 / (1.0 + np.exp(-logits))
+        bits = (probs > 0.5).astype(np.float32)
+        tracking_id = _bits_to_tracking_id(bits)
+
+        # Confidence: how far each bit is from 0.5.
+        confidence = float(np.mean(np.abs(probs - 0.5)) * 2 * 100)
+        return tracking_id, {
+            "tracking_id": tracking_id,
+            "confidence": round(confidence, 2),
+            "method": "neural",
+            "found": False,  # caller will check DB; service can't know
         }
-        
-        return tracking_id, metrics
-    
+
     def test_robustness(
         self,
         cover_image: np.ndarray,
         tracking_id: str,
-        distortions: list = None,
+        distortions: list | None = None,
     ) -> Dict[str, Any]:
-        """
-        Test robustness of encoding against various distortions
-        
-        Args:
-            cover_image: Original image
-            tracking_id: Message to encode
-            distortions: List of distortion types to test
-        
-        Returns:
-            results: Accuracy and metrics for each distortion
-        """
-        if distortions is None:
-            distortions = ['identity', 'jpeg', 'blur', 'crop', 'resize']
-        
-        # Encode
-        encoded_image, encode_metrics = self.encode(cover_image, tracking_id)
-        
-        # Test each distortion
-        results = {
-            'tracking_id': tracking_id,
-            'encode_metrics': encode_metrics,
-            'robustness_tests': {}
+        from app.utils import NoiseProcessor
+
+        encoded, enc_metrics = self.encode(cover_image, tracking_id)
+        results: Dict[str, Any] = {
+            "tracking_id": tracking_id,
+            "encode_metrics": enc_metrics,
+            "robustness_tests": {},
         }
-        
-        for distortion in distortions:
-            decoded_id, decode_metrics = self.decode(encoded_image, apply_noise=distortion)
-            
-            success = (decoded_id == tracking_id)
-            results['robustness_tests'][distortion] = {
-                'success': success,
-                'decoded_id': decoded_id,
-                'confidence': decode_metrics['confidence'],
+
+        processor = NoiseProcessor()
+        for d in (distortions or ["identity", "jpeg", "blur", "crop", "resize"]):
+            test_img = encoded.copy()
+            if d == "jpeg":
+                test_img = processor.apply_jpeg_compression(test_img, quality=50)
+            elif d == "blur":
+                test_img = processor.apply_gaussian_blur(test_img)
+            elif d == "crop":
+                test_img = processor.apply_crop(test_img, 0.5)
+            elif d == "resize":
+                test_img = processor.apply_resize(test_img)
+            decoded_id, dec_metrics = self.decode(test_img)
+            results["robustness_tests"][d] = {
+                "success": decoded_id == tracking_id,
+                "decoded_id": decoded_id,
+                "confidence": dec_metrics["confidence"],
             }
-        
         return results

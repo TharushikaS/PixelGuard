@@ -1,7 +1,15 @@
 // API service for frontend
 import axios from 'axios';
 
-const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
+export const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
+
+// Build an absolute URL out of a server-returned path (which the backend
+// returns as a leading-slash path like "/api/v1/encode/download/abc").
+export const buildAbsoluteUrl = (path) => {
+  if (!path) return path;
+  if (/^https?:\/\//.test(path)) return path;       // already absolute
+  return `${API_URL}${path.startsWith('/') ? '' : '/'}${path}`;
+};
 
 const api = axios.create({
   baseURL: API_URL,

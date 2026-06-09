@@ -27,18 +27,23 @@ class ImageProcessor:
         return image
     
     @staticmethod
-    def load_image_from_bytes(image_bytes: bytes, size: int = 256) -> np.ndarray:
-        """Load image from bytes"""
+    def load_image_from_bytes(image_bytes: bytes, size: int | None = 256) -> np.ndarray:
+        """
+        Load image from bytes. If `size` is None, keep the original resolution
+        (used by the LSB path so the stego image is bit-identical to the
+        cover except for the LSBs).
+        """
         nparr = np.frombuffer(image_bytes, np.uint8)
         image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
+
         if image is None:
             raise ValueError("Could not decode image from bytes")
-        
+
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        image = cv2.resize(image, (size, size))
+        if size is not None:
+            image = cv2.resize(image, (size, size))
         image = image.astype(np.float32) / 255.0
-        
+
         return image
     
     @staticmethod
