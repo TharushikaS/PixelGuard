@@ -41,6 +41,7 @@ from app.models import (  # noqa: E402
     Decoder,
     Discriminator,
     Encoder,
+    NoiseLayer,
 )
 
 
@@ -107,6 +108,7 @@ class HiDDeNTrainer:
         lr_encdec: float = 1e-3,
         lr_disc: float = 1e-3,
         model_dir: str = "./models",
+        noise_mode: str = "identity",    # "identity" | "combined" | a NoiseLayer kind
     ):
         self.message_length = message_length
         self.image_size = image_size
@@ -120,7 +122,17 @@ class HiDDeNTrainer:
         self.encoder = Encoder(message_length=message_length)
         self.decoder = Decoder(message_length=message_length)
         self.discriminator = Discriminator()
-        self.noise_layer = CombinedNoiseLayer()
+
+        # Noise layer selection. Curriculum recipe:
+        #   Phase 1 — "identity" (no distortion) for ~20-30 epochs to lock
+        #             in the encoder/decoder cycle.
+        #   Phase 2 — "combined" for 20-50 more epochs to harden against
+        #             JPEG / blur / crop / resize.
+        if noise_mode == "combined":
+            self.noise_layer = CombinedNoiseLayer()
+        else:
+            self.noise_layer = NoiseLayer(kind=noise_mode)
+        self.noise_mode = noise_mode
 
         # Optimizers — paper trains encoder+decoder together w/ one Adam,
         # discriminator separately.
@@ -267,6 +279,16 @@ def main():
     parser.add_argument("--lr-encdec", type=float, default=1e-3)
     parser.add_argument("--lr-disc", type=float, default=1e-3)
     parser.add_argument("--model-dir", default="./models")
+    parser.add_argument(
+        "--noise-mode",
+        default="identity",
+        choices=["identity", "combined", "dropout", "cropout", "crop", "gaussian", "jpeg_mask"],
+        help=(
+            "Distortion applied during training. 'identity' is the right "
+            "choice for the first warm-up run (fast convergence). Use "
+            "'combined' or a specific kind once basic encode/decode works."
+        ),
+    )
     args = parser.parse_args()
 
     # Report device info up front.
@@ -296,7 +318,9 @@ def main():
         lr_encdec=args.lr_encdec,
         lr_disc=args.lr_disc,
         model_dir=args.model_dir,
+        noise_mode=args.noise_mode,
     )
+    print(f"[train] noise_mode={args.noise_mode}")
 
     trainer.fit(dataset, epochs=args.epochs, steps_per_epoch=args.steps_per_epoch)
     print("Training complete.")
