@@ -48,13 +48,16 @@ class ImageProcessor:
     
     @staticmethod
     def save_image(image: np.ndarray, output_path: str) -> None:
-        """Save image"""
-        # Denormalize
-        image = (image * 255).astype(np.uint8)
-        
-        # Convert RGB to BGR for OpenCV
+        """
+        Save an RGB image to disk.
+
+        Accepts either uint8 [0,255] or float [0,1]. Float input is
+        rounded (not truncated) before casting to uint8, which is what
+        keeps LSB-embedded watermarks intact across the float roundtrip.
+        """
+        if image.dtype != np.uint8:
+            image = np.round(np.clip(image * 255.0, 0, 255)).astype(np.uint8)
         image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-        
         cv2.imwrite(output_path, image)
     
     @staticmethod

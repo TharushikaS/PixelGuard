@@ -43,10 +43,16 @@ def _bits_to_bytes(bits: np.ndarray) -> bytes:
 
 
 def _ensure_uint8(image: np.ndarray) -> np.ndarray:
-    """Coerce [0,1] floats to [0,255] uint8."""
+    """
+    Coerce [0,1] floats to [0,255] uint8.
+
+    CRITICAL: must use np.round, not .astype(uint8) directly.
+    `(101/255)*255` evaluates to 100.9999... due to floating-point rounding;
+    a plain cast truncates to 100 and flips the LSB we just embedded.
+    """
     if image.dtype == np.uint8:
         return image
-    return np.clip(image * 255.0, 0, 255).astype(np.uint8)
+    return np.round(np.clip(image * 255.0, 0, 255)).astype(np.uint8)
 
 
 class LSBSteganographyService:

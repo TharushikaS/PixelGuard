@@ -140,68 +140,58 @@ const Decode = () => {
         {/* Results Section */}
         {result && (
           <div className="card">
-            <div className="card-header">
-              <h3 className="card-title">🎯 Tracking Results</h3>
+            <div className="card-header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <h3 className="card-title" style={{ margin: 0 }}>Tracking Results</h3>
+              {/* Found / Not-Found badge */}
+              {result.found ? (
+                <span style={{
+                  backgroundColor: '#dcfce7',
+                  color: '#166534',
+                  padding: '0.25rem 0.75rem',
+                  borderRadius: '999px',
+                  fontSize: '0.75rem',
+                  fontWeight: 'bold',
+                }}>
+                  ✓ Owner record found
+                </span>
+              ) : (
+                <span style={{
+                  backgroundColor: '#fef3c7',
+                  color: '#92400e',
+                  padding: '0.25rem 0.75rem',
+                  borderRadius: '999px',
+                  fontSize: '0.75rem',
+                  fontWeight: 'bold',
+                }}>
+                  ⚠ No record in database
+                </span>
+              )}
             </div>
 
             <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
               <div style={{ borderBottom: '1px solid #dee2e6', paddingBottom: '1rem' }}>
                 <p style={{ color: '#6c757d', fontSize: '0.875rem', marginBottom: '0.25rem' }}>
-                  Tracking ID
+                  Recovered Tracking ID
                 </p>
                 <p style={{ fontSize: '1rem', fontFamily: 'monospace', fontWeight: 'bold', wordBreak: 'break-all' }}>
                   {result.tracking_id}
                 </p>
               </div>
 
-              {result.owner_name && (
-                <div>
-                  <p style={{ color: '#6c757d', fontSize: '0.875rem', marginBottom: '0.25rem' }}>
-                    Owner Name
-                  </p>
-                  <p style={{ fontSize: '1rem', fontWeight: '500' }}>
-                    {result.owner_name}
-                  </p>
-                </div>
-              )}
-
-              {result.owner_email && (
-                <div>
-                  <p style={{ color: '#6c757d', fontSize: '0.875rem', marginBottom: '0.25rem' }}>
-                    Email
-                  </p>
-                  <p style={{ fontSize: '1rem', fontWeight: '500' }}>
-                    <a href={`mailto:${result.owner_email}`} style={{ color: '#6366f1' }}>
-                      {result.owner_email}
-                    </a>
-                  </p>
-                </div>
-              )}
-
-              {result.location && (
-                <div>
-                  <p style={{ color: '#6c757d', fontSize: '0.875rem', marginBottom: '0.25rem' }}>
-                    Location
-                  </p>
-                  <p style={{ fontSize: '1rem', fontWeight: '500' }}>
-                    {result.location}
-                  </p>
-                </div>
-              )}
-
+              {/* Confidence meter — show even when no DB record */}
               <div>
                 <p style={{ color: '#6c757d', fontSize: '0.875rem', marginBottom: '0.25rem' }}>
-                  Confidence
+                  Decoder Confidence
                 </p>
-                <div style={{ 
-                  backgroundColor: '#e0e7ff', 
-                  borderRadius: '0.25rem', 
+                <div style={{
+                  backgroundColor: '#e0e7ff',
+                  borderRadius: '0.25rem',
                   overflow: 'hidden',
                   height: '24px'
                 }}>
-                  <div 
+                  <div
                     style={{
-                      backgroundColor: '#6366f1',
+                      backgroundColor: result.confidence > 75 ? '#10b981' : result.confidence > 50 ? '#f59e0b' : '#ef4444',
                       height: '100%',
                       width: `${result.confidence}%`,
                       transition: 'width 0.3s ease',
@@ -210,13 +200,73 @@ const Decode = () => {
                       justifyContent: 'center',
                       color: 'white',
                       fontSize: '0.75rem',
-                      fontWeight: 'bold'
+                      fontWeight: 'bold',
                     }}
                   >
                     {result.confidence > 10 && `${result.confidence.toFixed(1)}%`}
                   </div>
                 </div>
               </div>
+
+              {/* Owner metadata — only when DB lookup succeeded */}
+              {result.found ? (
+                <>
+                  {result.owner_name && (
+                    <div>
+                      <p style={{ color: '#6c757d', fontSize: '0.875rem', marginBottom: '0.25rem' }}>Owner Name</p>
+                      <p style={{ fontSize: '1rem', fontWeight: '500' }}>{result.owner_name}</p>
+                    </div>
+                  )}
+                  {result.owner_email && (
+                    <div>
+                      <p style={{ color: '#6c757d', fontSize: '0.875rem', marginBottom: '0.25rem' }}>Email</p>
+                      <p style={{ fontSize: '1rem', fontWeight: '500' }}>
+                        <a href={`mailto:${result.owner_email}`} style={{ color: '#6366f1' }}>
+                          {result.owner_email}
+                        </a>
+                      </p>
+                    </div>
+                  )}
+                  {result.location && (
+                    <div>
+                      <p style={{ color: '#6c757d', fontSize: '0.875rem', marginBottom: '0.25rem' }}>Location</p>
+                      <p style={{ fontSize: '1rem', fontWeight: '500' }}>{result.location}</p>
+                    </div>
+                  )}
+                  {result.description && (
+                    <div>
+                      <p style={{ color: '#6c757d', fontSize: '0.875rem', marginBottom: '0.25rem' }}>Description</p>
+                      <p style={{ fontSize: '1rem', whiteSpace: 'pre-wrap' }}>{result.description}</p>
+                    </div>
+                  )}
+                  {result.created_at && (
+                    <div>
+                      <p style={{ color: '#6c757d', fontSize: '0.875rem', marginBottom: '0.25rem' }}>Registered</p>
+                      <p style={{ fontSize: '0.875rem', color: '#6c757d' }}>
+                        {new Date(result.created_at).toLocaleString()}
+                      </p>
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div style={{
+                  backgroundColor: '#fef3c7',
+                  border: '1px solid #fcd34d',
+                  borderRadius: '0.5rem',
+                  padding: '1rem',
+                  fontSize: '0.875rem',
+                  color: '#78350f',
+                }}>
+                  <strong>What this means:</strong> The decoder extracted bits from the image,
+                  but those bits don't match any tracking ID in our database. This usually means
+                  one of:
+                  <ul style={{ marginTop: '0.5rem', marginBottom: 0, paddingLeft: '1.25rem' }}>
+                    <li>The image was never registered with PixelGuard</li>
+                    <li>The image was heavily modified after encoding (JPEG compression, cropping, …)</li>
+                    <li>The image is a regular photo with no embedded watermark</li>
+                  </ul>
+                </div>
+              )}
             </div>
           </div>
         )}
