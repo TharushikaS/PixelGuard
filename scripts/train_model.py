@@ -48,28 +48,9 @@ from app.models import (  # noqa: E402
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
-def build_dataset(
-    image_dir: str,
-    image_size: int,
-    batch_size: int,
-    message_length: int,
-    shuffle_buffer: int = 1024,
-) -> tf.data.Dataset:
-    """
-    A `tf.data.Dataset` that yields (cover, message) pairs.
-
-    Supports any folder of jpg/jpeg/png files. Images are randomly
-    cropped + resized to image_size×image_size and normalized to [0, 1].
-    Messages are random bits drawn fresh for every example.
-    """
-    patterns = [
-        os.path.join(image_dir, "*.jpg"),
-        os.path.join(image_dir, "*.jpeg"),
-        os.path.join(image_dir, "*.png"),
-    ]
-    files = tf.data.Dataset.list_files(patterns, shuffle=True)
-
-    def _load(path):
+def _load_image_for_training(image_size: int):
+    """Returns a tf.function-compatible loader: path -> (img, random_msg)."""
+    def _load(path, message_length: int):
         raw = tf.io.read_file(path)
         img = tf.io.decode_image(raw, channels=3, expand_animations=False)
         img.set_shape([None, None, 3])
@@ -85,14 +66,67 @@ def build_dataset(
             tf.float32,
         )
         return img, msg
+    return _load
 
-    return (
-        files
+
+def _list_image_paths(image_dir: str) -> list:
+    """All jpg/jpeg/png paths in a folder, sorted for reproducibility."""
+    patterns = ("*.jpg", "*.jpeg", "*.png")
+    paths = []
+    for pat in patterns:
+        paths += tf.io.gfile.glob(os.path.join(image_dir, pat))
+    paths.sort()
+    return paths
+
+
+def build_datasets(
+    image_dir: str,
+    image_size: int,
+    batch_size: int,
+    message_length: int,
+    val_split: float = 0.1,
+) -> tuple[tf.data.Dataset, tf.data.Dataset, int, int]:
+    """
+    Split the image folder into TRAIN and TEST sets, then build a
+    tf.data.Dataset for each.
+
+    Returns:
+        (train_ds, test_ds, n_train, n_test)
+
+    Each dataset yields (cover, message) pairs where message is a freshly
+    sampled random bit string per example. The test split is held out
+    from training entirely.
+    """
+    all_paths = _list_image_paths(image_dir)
+    if not all_paths:
+        raise FileNotFoundError(f"No images found under {image_dir}")
+
+    n_test = max(1, int(len(all_paths) * val_split))
+    n_train = len(all_paths) - n_test
+
+    # Stable, deterministic split: last `n_test` paths after sort = test set.
+    train_paths = all_paths[:n_train]
+    test_paths = all_paths[n_train:]
+
+    loader = _load_image_for_training(image_size)
+
+    train_ds = (
+        tf.data.Dataset.from_tensor_slices(train_paths)
+        .shuffle(min(len(train_paths), 4096), reshuffle_each_iteration=True)
         .repeat()
-        .map(_load, num_parallel_calls=tf.data.AUTOTUNE)
+        .map(lambda p: loader(p, message_length), num_parallel_calls=tf.data.AUTOTUNE)
         .batch(batch_size, drop_remainder=True)
         .prefetch(tf.data.AUTOTUNE)
     )
+
+    test_ds = (
+        tf.data.Dataset.from_tensor_slices(test_paths)
+        .map(lambda p: loader(p, message_length), num_parallel_calls=tf.data.AUTOTUNE)
+        .batch(batch_size, drop_remainder=False)
+        .prefetch(tf.data.AUTOTUNE)
+    )
+
+    return train_ds, test_ds, n_train, n_test
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +190,13 @@ class HiDDeNTrainer:
             decoded_logits = self.decoder(noisy, training=True)
             disc_on_stego = self.discriminator(stego, training=False)
 
-            L_M = self.bce_logits(message, decoded_logits)
+            # Paper §3: L_M = ||M_in - M_out||^2 / L  (mean squared error).
+            # We use sigmoid(logits) so predictions are in [0, 1] like the
+            # target bits {0, 1}. MSE keeps L_M numerically comparable to
+            # L_I (both in roughly the same scale), letting λ_I = 0.7
+            # actually balance message and image objectives as designed.
+            decoded_probs = tf.sigmoid(decoded_logits)
+            L_M = tf.reduce_mean(tf.square(message - decoded_probs))
 
             # Proposal §4.3: "Reconstruction Loss ... MSE and SSIM, ensuring
             # minimal embedding impact while preserving perceptual image quality."
@@ -194,7 +234,7 @@ class HiDDeNTrainer:
         )
 
         # ---------------- Metrics ----------------
-        pred = tf.cast(tf.sigmoid(decoded_logits) > 0.5, tf.float32)
+        pred = tf.cast(decoded_probs > 0.5, tf.float32)
         bit_acc = tf.reduce_mean(
             tf.cast(tf.equal(pred, message), tf.float32)
         )
@@ -209,7 +249,41 @@ class HiDDeNTrainer:
         }
 
     # ------------------------------------------------------------------
-    def fit(self, dataset, epochs: int, steps_per_epoch: int):
+    @tf.function
+    def eval_step(self, cover, message):
+        """Forward pass only — no gradient updates. Used on the test set."""
+        stego = self.encoder([cover, message], training=False)
+        # No noise on test — measure clean encode/decode roundtrip.
+        decoded_logits = self.decoder(stego, training=False)
+
+        pred = tf.cast(tf.sigmoid(decoded_logits) > 0.5, tf.float32)
+        bit_acc = tf.reduce_mean(tf.cast(tf.equal(pred, message), tf.float32))
+
+        mse = tf.reduce_mean(tf.square(cover - stego))
+        psnr = 10.0 * (tf.math.log(1.0 / (mse + 1e-12)) / tf.math.log(10.0))
+        ssim = tf.reduce_mean(tf.image.ssim(cover, stego, max_val=1.0))
+        return bit_acc, psnr, ssim
+
+    def evaluate(self, test_ds):
+        """Compute test bit_acc / PSNR / SSIM over the entire held-out set."""
+        sum_acc = sum_psnr = sum_ssim = 0.0
+        n_batches = 0
+        for cover, msg in test_ds:
+            ba, psnr, ssim = self.eval_step(cover, msg)
+            sum_acc += float(ba.numpy())
+            sum_psnr += float(psnr.numpy())
+            sum_ssim += float(ssim.numpy())
+            n_batches += 1
+        if n_batches == 0:
+            return None
+        return {
+            "bit_acc": sum_acc / n_batches,
+            "psnr":    sum_psnr / n_batches,
+            "ssim":    sum_ssim / n_batches,
+        }
+
+    # ------------------------------------------------------------------
+    def fit(self, dataset, epochs: int, steps_per_epoch: int, test_ds=None):
         ds_iter = iter(dataset)
         for epoch in range(1, epochs + 1):
             t0 = time.time()
@@ -233,13 +307,23 @@ class HiDDeNTrainer:
             for k in agg:
                 agg[k] /= steps_per_epoch
 
-            print(
+            line = (
                 f"[epoch {epoch:3d}] time={time.time() - t0:.1f}s  "
                 f"L_M={agg['L_M']:.4f} L_I={agg['L_I']:.4f} "
                 f"L_G={agg['L_G']:.4f} L_D={agg['L_D']:.4f} "
-                f"bit_acc={agg['bit_acc']*100:.2f}% "
+                f"train: bit_acc={agg['bit_acc']*100:.2f}% "
                 f"PSNR={agg['psnr']:.2f}dB SSIM={agg['ssim']:.4f}"
             )
+
+            # Evaluate on the held-out test set (no noise, no grads).
+            if test_ds is not None:
+                test_metrics = self.evaluate(test_ds)
+                if test_metrics is not None:
+                    line += (
+                        f"   | test: bit_acc={test_metrics['bit_acc']*100:.2f}% "
+                        f"PSNR={test_metrics['psnr']:.2f}dB SSIM={test_metrics['ssim']:.4f}"
+                    )
+            print(line)
 
             self.save_checkpoint(epoch, cover, msg)
 
@@ -287,9 +371,13 @@ def main():
     parser.add_argument("--lr-disc", type=float, default=1e-3)
     parser.add_argument("--model-dir", default="./models")
     parser.add_argument(
+        "--val-split", type=float, default=0.1,
+        help="Fraction of images held out for test/validation (default 0.1 = 10%%)",
+    )
+    parser.add_argument(
         "--noise-mode",
         default="identity",
-        choices=["identity", "combined", "dropout", "cropout", "crop", "gaussian", "jpeg_mask"],
+        choices=["identity", "combined", "dropout", "cropout", "crop", "gaussian", "jpeg_mask", "jpeg_drop"],
         help=(
             "Distortion applied during training. 'identity' is the right "
             "choice for the first warm-up run (fast convergence). Use "
@@ -310,12 +398,14 @@ def main():
     else:
         print("No GPU detected — training on CPU will be SLOW.")
 
-    dataset = build_dataset(
+    train_ds, test_ds, n_train, n_test = build_datasets(
         args.image_dir,
         image_size=args.image_size,
         batch_size=args.batch_size,
         message_length=args.message_length,
+        val_split=args.val_split,
     )
+    print(f"[data] {n_train} training images, {n_test} held-out test images")
 
     trainer = HiDDeNTrainer(
         message_length=args.message_length,
@@ -329,7 +419,12 @@ def main():
     )
     print(f"[train] noise_mode={args.noise_mode}")
 
-    trainer.fit(dataset, epochs=args.epochs, steps_per_epoch=args.steps_per_epoch)
+    trainer.fit(
+        train_ds,
+        epochs=args.epochs,
+        steps_per_epoch=args.steps_per_epoch,
+        test_ds=test_ds,
+    )
     print("Training complete.")
 
 

@@ -72,6 +72,29 @@ def _jpeg_mask_keep_25_y_9_uv() -> np.ndarray:
     return mask_y, mask_c
 
 
+def _jpeg_drop_keep_probabilities():
+    """
+    JPEG-Drop: per-coefficient keep probability in zig-zag order.
+
+    Paper §3: "zeros channels with higher drop probabilities for higher-
+    frequency coefficients." We ramp keep-probability linearly from 1.0
+    at DC to 0.1 at the highest frequency, with Y dropped less
+    aggressively than U/V (matching JPEG's chroma subsampling intuition).
+    """
+    zigzag = [
+        0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5,
+        12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28,
+        35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
+        58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
+    ]
+    keep_y = np.zeros(64, dtype=np.float32)
+    keep_c = np.zeros(64, dtype=np.float32)
+    for rank, idx in enumerate(zigzag):
+        keep_y[idx] = 1.0 - 0.9 * (rank / 63.0)
+        keep_c[idx] = max(0.05, 1.0 - 1.6 * (rank / 63.0))
+    return keep_y, keep_c
+
+
 # ---------------------------------------------------------------------------
 # Individual noise ops
 # ---------------------------------------------------------------------------
@@ -141,12 +164,20 @@ def _apply_gaussian(stego, sigma: float):
     )
 
 
-# JPEG-Mask: precompute DCT kernels and the zig-zag mask once.
+# JPEG-Mask / JPEG-Drop: precompute DCT kernels and per-coefficient
+# masks / drop-probabilities once.
 _DCT_BASIS = tf.constant(_dct_basis_8x8(), dtype=tf.float32)        # (8,8,1,64)
 _DCT_BASIS_T = tf.transpose(_DCT_BASIS, (0, 1, 3, 2))                # (8,8,64,1)
+
 _JPEG_MASK_Y, _JPEG_MASK_C = _jpeg_mask_keep_25_y_9_uv()
 _JPEG_MASKS = tf.constant(
     np.stack([_JPEG_MASK_Y, _JPEG_MASK_C, _JPEG_MASK_C], axis=0),    # (3, 64)
+    dtype=tf.float32,
+)
+
+_JPEG_DROP_KEEP_Y, _JPEG_DROP_KEEP_C = _jpeg_drop_keep_probabilities()
+_JPEG_DROP_KEEP = tf.constant(
+    np.stack([_JPEG_DROP_KEEP_Y, _JPEG_DROP_KEEP_C, _JPEG_DROP_KEEP_C], axis=0),  # (3, 64)
     dtype=tf.float32,
 )
 
@@ -186,6 +217,41 @@ def _apply_jpeg_mask(stego: tf.Tensor) -> tf.Tensor:
     return tf.image.yuv_to_rgb(yuv_recon)
 
 
+def _apply_jpeg_drop(stego: tf.Tensor) -> tf.Tensor:
+    """
+    DCT → stochastic dropout of coefficients (more likely on high freqs)
+    → inverse DCT.
+
+    Same DCT/iDCT plumbing as JPEG-Mask, but coefficients are dropped
+    per-batch with a Bernoulli mask whose `p_keep` shrinks with
+    frequency (paper §3 "JPEG-Drop").
+    """
+    yuv = tf.image.rgb_to_yuv(stego)
+    out_channels = []
+
+    for c in range(3):
+        channel = yuv[..., c:c + 1]
+        coefs = tf.nn.conv2d(channel, _DCT_BASIS, strides=8, padding="VALID")
+
+        # Bernoulli mask: drop higher-frequency coefs with higher probability.
+        # Sample one mask per batch element to add stochasticity.
+        rand = tf.random.uniform(tf.shape(coefs))                    # (B, h, w, 64)
+        keep_mask = tf.cast(rand < _JPEG_DROP_KEEP[c], coefs.dtype)
+        coefs = coefs * keep_mask
+
+        recon = tf.nn.conv2d_transpose(
+            coefs,
+            _DCT_BASIS,
+            output_shape=tf.shape(channel),
+            strides=(1, 8, 8, 1),
+            padding="VALID",
+        )
+        out_channels.append(recon)
+
+    yuv_recon = tf.concat(out_channels, axis=-1)
+    return tf.image.yuv_to_rgb(yuv_recon)
+
+
 # ---------------------------------------------------------------------------
 # Public layers
 # ---------------------------------------------------------------------------
@@ -195,7 +261,7 @@ class NoiseLayer(keras.layers.Layer):
     specialized models in the paper's Section 4.2.
 
     `kind` is one of:
-        identity, dropout, cropout, crop, gaussian, jpeg_mask
+        identity, dropout, cropout, crop, gaussian, jpeg_mask, jpeg_drop
     """
 
     def __init__(self, kind: str = "identity", intensity: float = 0.3, **kw):
@@ -221,6 +287,8 @@ class NoiseLayer(keras.layers.Layer):
             return _apply_gaussian(stego, sigma=sigma)
         if self.kind == "jpeg_mask":
             return _apply_jpeg_mask(stego)
+        if self.kind == "jpeg_drop":
+            return _apply_jpeg_drop(stego)
         return stego
 
 
@@ -244,21 +312,24 @@ class CombinedNoiseLayer(keras.layers.Layer):
         p = tf.random.uniform([], 0.0, 1.0)
         # We use tf.switch_case via a chain of conds so this works in graph mode.
 
-        def _identity(): return stego
-        def _dropout():   return _apply_dropout(cover, stego, drop_prob=0.3)
-        def _cropout():   return _apply_cropout(cover, stego, keep_ratio=0.3)
-        def _crop():      return _apply_crop(stego, keep_ratio=0.5)
-        def _gauss():     return _apply_gaussian(stego, sigma=2.0)
-        def _jpeg():      return _apply_jpeg_mask(stego)
+        def _identity():   return stego
+        def _dropout():    return _apply_dropout(cover, stego, drop_prob=0.3)
+        def _cropout():    return _apply_cropout(cover, stego, keep_ratio=0.3)
+        def _crop():       return _apply_crop(stego, keep_ratio=0.5)
+        def _gauss():      return _apply_gaussian(stego, sigma=2.0)
+        def _jpeg_mask():  return _apply_jpeg_mask(stego)
+        def _jpeg_drop():  return _apply_jpeg_drop(stego)
 
+        # Seven buckets equally weighted — identity + 4 spatial + 2 JPEG variants.
         return tf.case(
             [
-                (p < 1.0 / 6.0,  _identity),
-                (p < 2.0 / 6.0,  _dropout),
-                (p < 3.0 / 6.0,  _cropout),
-                (p < 4.0 / 6.0,  _crop),
-                (p < 5.0 / 6.0,  _gauss),
+                (p < 1.0 / 7.0,  _identity),
+                (p < 2.0 / 7.0,  _dropout),
+                (p < 3.0 / 7.0,  _cropout),
+                (p < 4.0 / 7.0,  _crop),
+                (p < 5.0 / 7.0,  _gauss),
+                (p < 6.0 / 7.0,  _jpeg_mask),
             ],
-            default=_jpeg,
+            default=_jpeg_drop,
             exclusive=False,
         )
