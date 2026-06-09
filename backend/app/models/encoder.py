@@ -1,22 +1,35 @@
 """
-HiDDeN Encoder — implementation faithful to:
+HiDDeN Encoder — strict paper + proposal implementation.
 
-  Zhu, Kaplan, Johnson, Fei-Fei. "HiDDeN: Hiding Data with Deep Networks."
-  ECCV 2018.
+Per Zhu et al. 2018 §3 and our project proposal §4.1:
 
-…with the extensions called out in our project proposal:
+  cover image (B, H, W, 3)  ─►  Conv-BN-ReLU stack  ─►  image features
+  message bits (B, L)       ─►  Dense projection    ─►  multi-channel message tensor (B, M)
+                                                          │
+                            spatial replication to (B, H, W, M)
+                                                          │
+                Concat(cover ⊕ image_features ⊕ msg_volume) along channel axis
+                                                          │
+                          1×1 Conv fuse to N channels
+                                                          │
+                          ResidualBlock × N (proposal §4.1: high-freq preservation)
+                                                          │
+                          Final 3×3 Conv → 3 channels, sigmoid
+                                                          │
+                                 Stego image I_en in [0, 1]    (direct, not residual)
 
-  * Fully-Convolutional Network (resolution-agnostic — no dense layers in
-    the message-handling path; works on any H×W at inference time).
-  * Residual blocks for high-frequency preservation (PSNR > 40 dB target).
-  * Residual-output formulation: the encoder predicts a small additive
-    perturbation `delta`, and  I_en = clip(I_co + α · delta, 0, 1).
-    This trains far more stably than learning the full stego image from
-    scratch, and matches what most HiDDeN reimplementations do.
-
-The message is treated as a "global statistical bias dispersed throughout
-the image" — every spatial location sees the full message via spatial
-replication, then convolutions decide how to thread it into the textures.
+Notes vs prior version:
+  * The message is now passed through a Dense layer before spatial replication
+    — matches the proposal verbatim:
+      "The message is first projected through a dense layer and then
+       transformed into a multi-channel feature tensor in order to address
+       this. Before being concatenated channel-wise, this enlarged message
+       is spatially replicated to match the dimensions of the image features."
+  * The encoder now outputs the stego image directly — matches the paper:
+      "After more convolutional layers, the encoder produces I_en, the
+       encoded image."
+    (Previous version was `cover + α·delta` for training stability; we keep
+    sigmoid at the head so the output stays bounded in [0, 1].)
 """
 from __future__ import annotations
 
@@ -26,10 +39,10 @@ from tensorflow.keras import layers
 
 
 # ---------------------------------------------------------------------------
-# Conv block + Residual block
+# Building blocks
 # ---------------------------------------------------------------------------
 class ConvBNReLU(layers.Layer):
-    """3×3 conv → BN → ReLU. The building block used throughout."""
+    """3×3 conv → BN → ReLU."""
 
     def __init__(self, channels: int, kernel: int = 3, **kw):
         super().__init__(**kw)
@@ -62,57 +75,42 @@ class ResidualBlock(layers.Layer):
 class Encoder(keras.Model):
     """
     Inputs:
-        cover   — (B, H, W, 3) image in [0, 1]
-        message — (B, L) binary bits (float32, 0.0 or 1.0)
+        cover   — (B, H, W, 3), float in [0, 1]
+        message — (B, L),       binary bits (0.0 / 1.0)
 
     Output:
-        stego   — (B, H, W, 3) image in [0, 1], visually close to `cover`
-
-    Architecture (paper-faithful with proposal's residual extension):
-
-        cover  ──► ConvBNReLU(C)
-                         │ image feats (B, H, W, C)
-        message ──► tile to (B, H, W, L)
-                         │
-                concat (cover + image_feats + msg_volume)
-                         │
-                1×1 fuse conv  ──►  (B, H, W, C)
-                         │
-                ResidualBlock × N
-                         │
-                1×1 conv → 3 channels, tanh
-                         │
-                delta ∈ [-1, 1]
-                         │
-                stego = clip(cover + α · delta, 0, 1)
+        stego   — (B, H, W, 3), float in [0, 1], visually similar to cover
     """
 
     def __init__(
         self,
         message_length: int = 32,
+        message_projection_dim: int = 64,
         conv_channels: int = 64,
         num_residual_blocks: int = 4,
-        perturbation_scale: float = 0.1,
     ):
         super().__init__()
         self.L = message_length
-        self.perturbation_scale = perturbation_scale
+        self.M = message_projection_dim
 
-        # Image feature extraction (kept at full resolution — FCN style)
+        # --- image feature extraction ---
         self.image_conv = ConvBNReLU(conv_channels)
 
-        # 1×1 projection after concat (cover + img_feats + msg_volume → conv_channels)
-        self.fuse = layers.Conv2D(
-            conv_channels, 1, padding="same", activation="relu"
-        )
+        # --- message projection (proposal §4.1) ---
+        # Dense → ReLU → reshape to a multi-channel tensor for spatial replication.
+        self.message_dense = layers.Dense(self.M, activation="relu")
 
-        # Residual stack — learns the embedding
+        # --- fuse cover + image_features + msg_volume to N channels ---
+        self.fuse = layers.Conv2D(conv_channels, 1, padding="same", activation="relu")
+
+        # --- residual stack (proposal §4.1) ---
         self.residual_blocks = [
             ResidualBlock(conv_channels) for _ in range(num_residual_blocks)
         ]
 
-        # Predict the residual / perturbation. tanh keeps it in [-1, 1].
-        self.delta_conv = layers.Conv2D(3, 1, padding="same", activation="tanh")
+        # --- direct stego output (paper §3) ---
+        # sigmoid keeps it bounded in [0, 1]; matches cover image range.
+        self.out_conv = layers.Conv2D(3, 3, padding="same", activation="sigmoid")
 
     def call(self, inputs, training=False):
         cover, message = inputs
@@ -121,27 +119,24 @@ class Encoder(keras.Model):
         H = tf.shape(cover)[1]
         W = tf.shape(cover)[2]
 
-        # ---- image features ----
+        # 1) image features
         img_feats = self.image_conv(cover, training=training)
 
-        # ---- message volume: replicate the L bits at every (h, w) ----
-        # message: (B, L) → (B, 1, 1, L) → tile to (B, H, W, L)
-        msg = tf.reshape(message, (B, 1, 1, self.L))
-        msg_vol = tf.tile(msg, (1, H, W, 1))
+        # 2) message → dense → multi-channel volume
+        msg_feats = self.message_dense(message)            # (B, M)
+        msg_feats = tf.reshape(msg_feats, (B, 1, 1, self.M))
+        msg_vol = tf.tile(msg_feats, (1, H, W, 1))         # (B, H, W, M)
 
-        # ---- fuse cover + image features + message volume ----
+        # 3) concat (cover + image features + message volume)
         x = tf.concat([cover, img_feats, msg_vol], axis=-1)
+
+        # 4) fuse to conv_channels
         x = self.fuse(x)
 
-        # ---- residual stack ----
+        # 5) residual stack
         for block in self.residual_blocks:
             x = block(x, training=training)
 
-        # ---- predict the small additive perturbation ----
-        delta = self.delta_conv(x)              # (B, H, W, 3), values in [-1, 1]
-
-        # ---- compose stego image ----
-        stego = tf.clip_by_value(
-            cover + self.perturbation_scale * delta, 0.0, 1.0
-        )
+        # 6) direct stego output
+        stego = self.out_conv(x)
         return stego

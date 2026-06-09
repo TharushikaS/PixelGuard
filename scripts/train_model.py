@@ -157,7 +157,12 @@ class HiDDeNTrainer:
             disc_on_stego = self.discriminator(stego, training=False)
 
             L_M = self.bce_logits(message, decoded_logits)
-            L_I = tf.reduce_mean(tf.square(cover - stego))
+
+            # Proposal §4.3: "Reconstruction Loss ... MSE and SSIM, ensuring
+            # minimal embedding impact while preserving perceptual image quality."
+            mse = tf.reduce_mean(tf.square(cover - stego))
+            ssim = tf.reduce_mean(tf.image.ssim(cover, stego, max_val=1.0))
+            L_I = mse + (1.0 - ssim)
 
             # Encoder wants disc(stego) → 1 (i.e. "this is a cover").
             L_G = self.bce_logits(
@@ -200,7 +205,7 @@ class HiDDeNTrainer:
 
         return {
             "L_M": L_M, "L_I": L_I, "L_G": L_G, "L_D": L_D,
-            "bit_acc": bit_acc, "psnr": psnr,
+            "bit_acc": bit_acc, "psnr": psnr, "ssim": ssim,
         }
 
     # ------------------------------------------------------------------
@@ -208,7 +213,7 @@ class HiDDeNTrainer:
         ds_iter = iter(dataset)
         for epoch in range(1, epochs + 1):
             t0 = time.time()
-            agg = {k: 0.0 for k in ["L_M", "L_I", "L_G", "L_D", "bit_acc", "psnr"]}
+            agg = {k: 0.0 for k in ["L_M", "L_I", "L_G", "L_D", "bit_acc", "psnr", "ssim"]}
 
             for step in range(steps_per_epoch):
                 cover, msg = next(ds_iter)
@@ -221,7 +226,8 @@ class HiDDeNTrainer:
                         f"  ep {epoch:3d} step {step:4d}/{steps_per_epoch} "
                         f"L_M={float(m['L_M']):.4f} L_I={float(m['L_I']):.4f} "
                         f"bit_acc={float(m['bit_acc'])*100:.1f}% "
-                        f"PSNR={float(m['psnr']):.1f}dB"
+                        f"PSNR={float(m['psnr']):.1f}dB "
+                        f"SSIM={float(m['ssim']):.4f}"
                     )
 
             for k in agg:
@@ -231,7 +237,8 @@ class HiDDeNTrainer:
                 f"[epoch {epoch:3d}] time={time.time() - t0:.1f}s  "
                 f"L_M={agg['L_M']:.4f} L_I={agg['L_I']:.4f} "
                 f"L_G={agg['L_G']:.4f} L_D={agg['L_D']:.4f} "
-                f"bit_acc={agg['bit_acc']*100:.2f}% PSNR={agg['psnr']:.2f}dB"
+                f"bit_acc={agg['bit_acc']*100:.2f}% "
+                f"PSNR={agg['psnr']:.2f}dB SSIM={agg['ssim']:.4f}"
             )
 
             self.save_checkpoint(epoch, cover, msg)
