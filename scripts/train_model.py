@@ -227,9 +227,10 @@ class HiDDeNTrainer:
     # ------------------------------------------------------------------
     def save_checkpoint(self, epoch: int, cover_batch, msg_batch):
         """Save weights + a sample stego image for visual inspection."""
-        self.encoder.save_weights(str(self.model_dir / "encoder"))
-        self.decoder.save_weights(str(self.model_dir / "decoder"))
-        self.discriminator.save_weights(str(self.model_dir / "discriminator"))
+        # Keras 3 (TF 2.16+) requires the .weights.h5 suffix.
+        self.encoder.save_weights(str(self.model_dir / "encoder.weights.h5"))
+        self.decoder.save_weights(str(self.model_dir / "decoder.weights.h5"))
+        self.discriminator.save_weights(str(self.model_dir / "discriminator.weights.h5"))
 
         # Sample image
         stego = self.encoder([cover_batch, msg_batch], training=False).numpy()

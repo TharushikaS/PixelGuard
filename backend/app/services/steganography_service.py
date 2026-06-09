@@ -78,24 +78,36 @@ class SteganographyService:
     # Weight management
     # ------------------------------------------------------------------
     def _load_weights(self) -> bool:
-        enc_path = os.path.join(settings.MODEL_PATH, "encoder")
-        dec_path = os.path.join(settings.MODEL_PATH, "decoder")
-        try:
-            # TF saves checkpoints as <prefix>.index + <prefix>.data-*
-            if os.path.exists(enc_path + ".index"):
-                self.encoder.load_weights(enc_path)
-                print(f"[stego/neural] loaded encoder from {enc_path}")
-            else:
-                print(f"[stego/neural] no encoder weights at {enc_path} (random init)")
-            if os.path.exists(dec_path + ".index"):
-                self.decoder.load_weights(dec_path)
-                print(f"[stego/neural] loaded decoder from {dec_path}")
-            else:
-                print(f"[stego/neural] no decoder weights at {dec_path} (random init)")
-            return True
-        except Exception as exc:  # noqa: BLE001
-            print(f"[stego/neural] weight load failed: {exc}")
+        # Keras 3 .weights.h5 format (newer). Also try the old TF-checkpoint
+        # prefix format for back-compat with weights saved on TF 2.15.
+        candidates = {
+            "encoder": [
+                os.path.join(settings.MODEL_PATH, "encoder.weights.h5"),
+                os.path.join(settings.MODEL_PATH, "encoder"),  # TF<=2.15 checkpoint
+            ],
+            "decoder": [
+                os.path.join(settings.MODEL_PATH, "decoder.weights.h5"),
+                os.path.join(settings.MODEL_PATH, "decoder"),
+            ],
+        }
+
+        def _load(net, paths, label):
+            for p in paths:
+                # h5: file must exist directly. checkpoint: a .index sibling.
+                exists = os.path.exists(p) or os.path.exists(p + ".index")
+                if exists:
+                    try:
+                        net.load_weights(p)
+                        print(f"[stego/neural] loaded {label} from {p}")
+                        return True
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"[stego/neural] {label} load failed at {p}: {exc}")
+            print(f"[stego/neural] no {label} weights found (random init)")
             return False
+
+        ok_e = _load(self.encoder, candidates["encoder"], "encoder")
+        ok_d = _load(self.decoder, candidates["decoder"], "decoder")
+        return ok_e and ok_d
 
     # ------------------------------------------------------------------
     # Public API
