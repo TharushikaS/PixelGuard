@@ -5,3 +5,5 @@ torch
 torchvision
 numpy
 pillow
+pymongo
+python-dotenv

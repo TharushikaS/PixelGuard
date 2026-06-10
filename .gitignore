@@ -41,3 +41,4 @@ data/
 runs/
 saved-runs/
 venv
+.env
