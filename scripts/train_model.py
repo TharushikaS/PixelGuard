@@ -198,9 +198,19 @@ class HiDDeNTrainer:
             decoded_probs = tf.sigmoid(decoded_logits)
             L_M = tf.reduce_mean(tf.square(message - decoded_probs))
 
-            # Proposal §4.3: "Reconstruction Loss ... MSE and SSIM, ensuring
-            # minimal embedding impact while preserving perceptual image quality."
-            mse = tf.reduce_mean(tf.square(cover - stego))
+            # Proposal §4.2-4.3: weighted per-channel MSE in YCbCr space +
+            # SSIM. Penalize luminance (Y) perturbations more than chroma
+            # (Cb, Cr) because humans see luminance differences more
+            # acutely. This pushes the encoder away from green-dominant
+            # embeddings (RGB MSE treats all channels equally; YCbCr MSE
+            # respects human perception).
+            yuv_cover = tf.image.rgb_to_yuv(cover)
+            yuv_stego = tf.image.rgb_to_yuv(stego)
+            mse_y  = tf.reduce_mean(tf.square(yuv_cover[..., 0:1] - yuv_stego[..., 0:1]))
+            mse_uv = tf.reduce_mean(tf.square(yuv_cover[..., 1:]  - yuv_stego[..., 1:]))
+            # 4:1 weighting follows JPEG chroma-subsampling intuition.
+            mse = 4.0 * mse_y + 1.0 * mse_uv
+
             ssim = tf.reduce_mean(tf.image.ssim(cover, stego, max_val=1.0))
             L_I = mse + (1.0 - ssim)
 
