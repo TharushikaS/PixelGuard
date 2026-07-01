@@ -7,8 +7,8 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   server: {
     proxy: {
-      '/encode': 'http://localhost:8000',
-      '/decode': 'http://localhost:8000'
+      '/encode': 'http://127.0.0.1:8000',
+      '/decode': 'http://127.0.0.1:8000'
     }
   }
 })
